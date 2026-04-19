@@ -1,0 +1,2472 @@
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  Upload, Download, Eraser, Pen, Eye, EyeOff,
+  ChevronUp, ChevronDown, Trash2, Grid3X3,
+  Layers, GripVertical, PaintBucket, Circle,
+  Play, Pause, Film, Minus, Plus, Square,
+  Wand2, MousePointer, Spline, Lasso,
+} from 'lucide-react';
+import { processDither } from './utils/dither';
+import { processGlow } from './utils/glow';
+import { processHalftone } from './utils/halftone';
+import { processLego } from './utils/lego';
+import {
+  processGlitch, processChromatic, processPixelate, processBlur,
+  processNoise, processVHS, processBloom, processEmboss,
+  processPosterize, processDuotone,
+  GlitchSettings, ChromaticSettings, PixelateSettings, BlurSettings,
+  NoiseSettings, VHSSettings, BloomSettings, EmbossSettings,
+  PosterizeSettings, DuotoneSettings,
+} from './utils/effects';
+import {
+  processNeonGlow, processMotionBlur, processTextFill,
+  NeonGlowSettings, MotionBlurSettings, TextFillSettings,
+} from './utils/newEffects';
+import {
+  AnchorPoint, PenPath, createAnchor, penPathToPath2D,
+  drawPenPathUI, hitTestPenPath, mirrorHandle, PenHitResult,
+} from './utils/penTool';
+import { magicWandSelect, smartObjectSelect } from './utils/smartSelect';
+import { cn } from './utils/cn';
+
+/* ─────────────────────────── Types ─────────────────────────── */
+type BlendMode =
+  | 'source-over' | 'multiply' | 'screen' | 'overlay'
+  | 'darken' | 'lighten' | 'color-dodge' | 'color-burn'
+  | 'hard-light' | 'soft-light' | 'difference' | 'exclusion' | 'luminosity';
+
+type MediaKind = 'image' | 'video';
+type ToolMode =
+  | 'none' | 'brush' | 'erase'
+  | 'select-rect' | 'select-ellipse'
+  | 'pen' | 'lasso' | 'magic-wand' | 'smart-object';
+type SelectionCombine = 'replace' | 'add' | 'subtract';
+type LayerType = 'dither' | 'glow' | 'halftone' | 'lego'
+  | 'glitch' | 'chromatic' | 'pixelate' | 'blur'
+  | 'noise' | 'vhs' | 'bloom' | 'emboss'
+  | 'posterize' | 'duotone'
+  | 'neon-glow' | 'motion-blur' | 'text-fill';
+
+interface DitherSettings {
+  pixelSize: number; matrixSize: number;
+  brightness: number; contrast: number;
+  darkColor: string; lightColor: string;
+}
+interface GlowSettings {
+  radius: number; intensity: number; threshold: number; color: string;
+}
+interface HalftoneSettings {
+  cellSize: number; exposure: number; gamma: number;
+  darkColor: string; lightColor: string;
+}
+interface LegoSettings {
+  brickSize: number; saturation: number; brightness: number;
+  studOpacity: number; quantize: number; borderWidth: number;
+}
+interface EffectLayer {
+  id: string; name: string; type: LayerType;
+  enabled: boolean; opacity: number; blendMode: BlendMode;
+  useMask: boolean;
+  settings: DitherSettings | GlowSettings | HalftoneSettings | LegoSettings
+    | GlitchSettings | ChromaticSettings | PixelateSettings | BlurSettings
+    | NoiseSettings | VHSSettings | BloomSettings | EmbossSettings
+    | PosterizeSettings | DuotoneSettings
+    | NeonGlowSettings | MotionBlurSettings | TextFillSettings;
+}
+interface SelectionShape {
+  id: string; type: 'rect' | 'ellipse'; combine: SelectionCombine;
+  x: number; y: number; w: number; h: number;
+}
+interface DraftSelection {
+  type: 'rect' | 'ellipse'; combine: SelectionCombine;
+  startX: number; startY: number; endX: number; endY: number;
+}
+
+const BLEND_MODES: { value: BlendMode; label: string }[] = [
+  { value: 'source-over', label: 'Normal' },
+  { value: 'multiply',    label: 'Multiply' },
+  { value: 'screen',      label: 'Screen' },
+  { value: 'overlay',     label: 'Overlay' },
+  { value: 'darken',      label: 'Darken' },
+  { value: 'lighten',     label: 'Lighten' },
+  { value: 'color-dodge', label: 'Color Dodge' },
+  { value: 'color-burn',  label: 'Color Burn' },
+  { value: 'hard-light',  label: 'Hard Light' },
+  { value: 'soft-light',  label: 'Soft Light' },
+  { value: 'difference',  label: 'Difference' },
+  { value: 'exclusion',   label: 'Exclusion' },
+  { value: 'luminosity',  label: 'Luminosity' },
+];
+
+let nextId = 1;
+const uid = () => `id-${nextId++}`;
+
+function defaultDither(): EffectLayer {
+  return {
+    id: uid(), name: 'Dither', type: 'dither',
+    enabled: true, opacity: 1, blendMode: 'source-over', useMask: false,
+    settings: { pixelSize: 3, matrixSize: 4, brightness: 10, contrast: 20, darkColor: '#000000', lightColor: '#ffffff' } as DitherSettings,
+  };
+}
+function defaultGlow(): EffectLayer {
+  return {
+    id: uid(), name: 'Glow', type: 'glow',
+    enabled: true, opacity: 0.7, blendMode: 'screen', useMask: false,
+    settings: { radius: 18, intensity: 1.4, threshold: 120, color: '#ffffff' } as GlowSettings,
+  };
+}
+function defaultHalftone(): EffectLayer {
+  return {
+    id: uid(), name: 'Halftone', type: 'halftone',
+    enabled: true, opacity: 1, blendMode: 'source-over', useMask: false,
+    settings: { cellSize: 10, exposure: 1, gamma: 1, darkColor: '#000000', lightColor: '#ffffff' } as HalftoneSettings,
+  };
+}
+function defaultLego(): EffectLayer {
+  return {
+    id: uid(), name: 'LEGO', type: 'lego',
+    enabled: true, opacity: 1, blendMode: 'source-over', useMask: false,
+    settings: { brickSize: 16, saturation: 1.2, brightness: 5, studOpacity: 0.85, quantize: 16, borderWidth: 2 } as LegoSettings,
+  };
+}
+function defaultGlitch(): EffectLayer {
+  return {
+    id: uid(), name: 'Glitch', type: 'glitch',
+    enabled: true, opacity: 1, blendMode: 'source-over', useMask: false,
+    settings: { intensity: 0.5, bands: 12, rgbShift: 8, seed: 42 } as GlitchSettings,
+  };
+}
+function defaultChromatic(): EffectLayer {
+  return {
+    id: uid(), name: 'Chromatic', type: 'chromatic',
+    enabled: true, opacity: 1, blendMode: 'source-over', useMask: false,
+    settings: { offsetR: 6, offsetB: -6, radial: 0.7 } as ChromaticSettings,
+  };
+}
+function defaultPixelate(): EffectLayer {
+  return {
+    id: uid(), name: 'Pixelate', type: 'pixelate',
+    enabled: true, opacity: 1, blendMode: 'source-over', useMask: false,
+    settings: { blockSize: 8, shape: 'square' } as PixelateSettings,
+  };
+}
+function defaultBlur(): EffectLayer {
+  return {
+    id: uid(), name: 'Blur', type: 'blur',
+    enabled: true, opacity: 1, blendMode: 'source-over', useMask: false,
+    settings: { type: 'gaussian', radius: 6, angle: 0 } as BlurSettings,
+  };
+}
+function defaultNoise(): EffectLayer {
+  return {
+    id: uid(), name: 'Noise', type: 'noise',
+    enabled: true, opacity: 0.6, blendMode: 'overlay', useMask: false,
+    settings: { amount: 25, monochrome: true, blend: 'overlay' } as NoiseSettings,
+  };
+}
+function defaultVHS(): EffectLayer {
+  return {
+    id: uid(), name: 'VHS/CRT', type: 'vhs',
+    enabled: true, opacity: 1, blendMode: 'source-over', useMask: false,
+    settings: { scanlineOpacity: 0.15, scanlineWidth: 2, noise: 15, colorBleed: 6, warp: 0.01 } as VHSSettings,
+  };
+}
+function defaultBloom(): EffectLayer {
+  return {
+    id: uid(), name: 'Bloom', type: 'bloom',
+    enabled: true, opacity: 0.8, blendMode: 'screen', useMask: false,
+    settings: { radius: 20, intensity: 1.2, threshold: 140, softness: 0.5 } as BloomSettings,
+  };
+}
+function defaultEmboss(): EffectLayer {
+  return {
+    id: uid(), name: 'Emboss', type: 'emboss',
+    enabled: true, opacity: 1, blendMode: 'source-over', useMask: false,
+    settings: { type: 'edge', strength: 1.2, mix: 0 } as EmbossSettings,
+  };
+}
+function defaultPosterize(): EffectLayer {
+  return {
+    id: uid(), name: 'Posterize', type: 'posterize',
+    enabled: true, opacity: 1, blendMode: 'source-over', useMask: false,
+    settings: { levels: 6, gamma: 1 } as PosterizeSettings,
+  };
+}
+function defaultDuotone(): EffectLayer {
+  return {
+    id: uid(), name: 'Duotone', type: 'duotone',
+    enabled: true, opacity: 1, blendMode: 'source-over', useMask: false,
+    settings: { darkColor: '#0a0a2e', lightColor: '#ff6b35', contrast: 1.2 } as DuotoneSettings,
+  };
+}
+function defaultNeonGlow(): EffectLayer {
+  return {
+    id: uid(), name: 'Neon Glow', type: 'neon-glow',
+    enabled: true, opacity: 0.9, blendMode: 'screen', useMask: false,
+    settings: { radius: 24, intensity: 1.8, threshold: 100, color1: '#ff00ff', color2: '#00ffff', colorMix: 0.5, edgeGlow: 0.6, pulsePhase: 0 } as NeonGlowSettings,
+  };
+}
+function defaultMotionBlur(): EffectLayer {
+  return {
+    id: uid(), name: 'Motion Blur', type: 'motion-blur',
+    enabled: true, opacity: 1, blendMode: 'source-over', useMask: false,
+    settings: { angle: 0, distance: 30, samples: 12, opacity: 0.8 } as MotionBlurSettings,
+  };
+}
+function defaultTextFill(): EffectLayer {
+  return {
+    id: uid(), name: 'Text Fill', type: 'text-fill',
+    enabled: true, opacity: 1, blendMode: 'source-over', useMask: false,
+    settings: {
+      text: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+      fontSize: 10, lineHeight: 1.1, letterSpacing: 0,
+      fontFamily: 'Space Grotesk',
+      color: '#ffffff', bgColor: 'transparent',
+      randomize: true, randomSeed: 42, density: 1,
+      fillOpaque: true, showOriginalColor: false,
+    } as TextFillSettings,
+  };
+}
+
+function ensureSize(canvas: HTMLCanvasElement, w: number, h: number) {
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+}
+function normalizeRect(x1: number, y1: number, x2: number, y2: number) {
+  return { x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.max(1, Math.abs(x2 - x1)), h: Math.max(1, Math.abs(y2 - y1)) };
+}
+function draftToShape(draft: DraftSelection): SelectionShape {
+  const { x, y, w, h } = normalizeRect(draft.startX, draft.startY, draft.endX, draft.endY);
+  return { id: 'draft', type: draft.type, combine: draft.combine, x, y, w, h };
+}
+function drawSelectionPath(ctx: CanvasRenderingContext2D, shape: Pick<SelectionShape, 'type'|'x'|'y'|'w'|'h'>) {
+  ctx.beginPath();
+  if (shape.type === 'ellipse') ctx.ellipse(shape.x + shape.w / 2, shape.y + shape.h / 2, shape.w / 2, shape.h / 2, 0, 0, Math.PI * 2);
+  else ctx.rect(shape.x, shape.y, shape.w, shape.h);
+}
+function formatTime(s: number) {
+  if (!Number.isFinite(s)) return '0:00';
+  return `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, '0')}`;
+}
+function sanitizeFileBase(name: string) {
+  return (name || 'eana-studio').replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9-_]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').toLowerCase() || 'eana-studio';
+}
+function detectTransparency(canvas: HTMLCanvasElement) {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx || !canvas.width || !canvas.height) return false;
+  const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  for (let i = 3; i < data.length; i += 4) if (data[i] < 250) return true;
+  return false;
+}
+
+
+function fitRect(srcW: number, srcH: number, dstW: number, dstH: number, allowUpscale = false) {
+  if (!srcW || !srcH || !dstW || !dstH) return { x: 0, y: 0, w: dstW, h: dstH };
+  const scale = Math.min(dstW / srcW, dstH / srcH);
+  const finalScale = allowUpscale ? scale : Math.min(1, scale);
+  const w = Math.max(1, Math.round(srcW * finalScale));
+  const h = Math.max(1, Math.round(srcH * finalScale));
+  return {
+    x: Math.round((dstW - w) / 2),
+    y: Math.round((dstH - h) / 2),
+    w,
+    h,
+  };
+}
+
+function getMaskBounds(maskCanvas: HTMLCanvasElement) {
+  const ctx = maskCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx || !maskCanvas.width || !maskCanvas.height) return null;
+  const { data } = ctx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+  let minX = maskCanvas.width;
+  let minY = maskCanvas.height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < maskCanvas.height; y++) {
+    for (let x = 0; x < maskCanvas.width; x++) {
+      const a = data[(y * maskCanvas.width + x) * 4 + 3];
+      if (a <= 8) continue;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    }
+  }
+
+  if (maxX < minX || maxY < minY) return null;
+  return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+}
+
+/* ─────────────────── UI primitives ─────────────────── */
+
+function SliderRow({ label, value, min, max, step, display, onChange }: {
+  label: string; value: number; min: number; max: number; step: number;
+  display: string; onChange: (v: number) => void;
+}) {
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-1.5">
+        <span className="text-[11px] text-[#666] font-medium tracking-wide">{label}</span>
+        <span className="text-[11px] font-mono text-[#888] bg-[#111] border border-[#222] rounded px-1.5 py-0.5">{display}</span>
+      </div>
+      <input
+        type="range" min={min} max={max} step={step} value={value}
+        onChange={e => onChange(parseFloat(e.target.value))}
+        className="range-slim cursor-pointer"
+      />
+    </div>
+  );
+}
+
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return <div className="section-label">{children}</div>;
+}
+
+function IconBtn({ onClick, title, children, active }: {
+  onClick: (e: React.MouseEvent) => void; title?: string;
+  children: React.ReactNode; active?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick} title={title}
+      className={cn(
+        'inline-flex items-center justify-center w-7 h-7 rounded transition',
+        active ? 'bg-white text-black' : 'text-[#555] hover:text-white hover:bg-[#1a1a1a]'
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function ToolBtn({ active, onClick, children, label }: {
+  active: boolean; onClick: () => void; children: React.ReactNode; label: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        'flex items-center gap-2 px-3 py-2 rounded text-[12px] font-medium transition border',
+        active
+          ? 'bg-white text-black border-white'
+          : 'bg-transparent text-[#777] border-[#222] hover:border-[#444] hover:text-white'
+      )}
+    >
+      {children}
+      <span>{label}</span>
+    </button>
+  );
+}
+
+function Divider() {
+  return <div className="border-t border-[#1a1a1a] my-3" />;
+}
+
+const LAYER_COLORS: Record<LayerType, string> = {
+  dither: '#888', glow: '#bbb', halftone: '#666', lego: '#aaa',
+  glitch: '#f44', chromatic: '#c4f', pixelate: '#6bf', blur: '#8cf',
+  noise: '#999', vhs: '#f84', bloom: '#ff8', emboss: '#aab',
+  posterize: '#6e6', duotone: '#fa6',
+  'neon-glow': '#f0f', 'motion-blur': '#4cf', 'text-fill': '#ccc',
+};
+
+function LayerDot({ type }: { type: LayerType }) {
+  return <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: LAYER_COLORS[type] || '#888' }} />;
+}
+
+/* ─────────────────────────── App ─────────────────────────── */
+export default function App() {
+  const [sourceUrl, setSourceUrl]         = useState<string | null>(null);
+  const [sourceKind, setSourceKind]       = useState<MediaKind | null>(null);
+  const [sourceName, setSourceName]       = useState('');
+  const [sourceReady, setSourceReady]     = useState(false);
+  const [sourceHasAlpha, setSourceHasAlpha] = useState(false);
+  const [mediaSize, setMediaSize]         = useState({ width: 0, height: 0 });
+  const [isWorkspaceSource, setIsWorkspaceSource] = useState(false);
+  const [isDropTargetActive, setIsDropTargetActive] = useState(false);
+
+  const [layers, setLayers]               = useState<EffectLayer[]>([]);
+  const [selectedLayerId, setSelectedLayerId] = useState<string | null>(null);
+  const [dragId, setDragId]               = useState<string | null>(null);
+
+  const [tool, setTool]                   = useState<ToolMode>('none');
+  const [brushSize, setBrushSize]         = useState(56);
+  const [isPointerActive, setIsPointerActive] = useState(false);
+
+  const [selectionMode, setSelectionMode] = useState<SelectionCombine>('replace');
+  const [selectionShapes, setSelectionShapes] = useState<SelectionShape[]>([]);
+  const [draftSelection, setDraftSelection]   = useState<DraftSelection | null>(null);
+  const [selectionActive, setSelectionActive] = useState(false);
+
+  // Pen tool state
+  const [penPath, setPenPath]             = useState<PenPath>({ id: uid(), points: [], closed: false });
+  const [penActiveIdx, setPenActiveIdx]   = useState<number | null>(null);
+  const [penDragInfo, setPenDragInfo]     = useState<PenHitResult>(null);
+  const [penHoverIdx, setPenHoverIdx]     = useState<number | null>(null);
+
+  // Lasso state
+  const [lassoPoints, setLassoPoints]     = useState<{x:number;y:number}[]>([]);
+
+  // Magic wand / smart settings
+  const [wandTolerance, setWandTolerance] = useState(32);
+  const [wandContiguous, setWandContiguous] = useState(true);
+  const [wandEdgeSmooth, setWandEdgeSmooth] = useState(1);
+  const [smartSensitivity, setSmartSensitivity] = useState(0.3);
+
+  const [previewFps, setPreviewFps]       = useState(18);
+  const [videoPlaying, setVideoPlaying]   = useState(false);
+  const [videoDuration, setVideoDuration] = useState(0);
+  const [videoCurrent, setVideoCurrent]   = useState(0);
+  const [isRecording, setIsRecording]     = useState(false);
+
+  const [secTools, setSecTools]       = useState(true);
+  const [secLayers, setSecLayers]     = useState(true);
+  const [secInspect, setSecInspect]   = useState(true);
+  const [secEffects, setSecEffects]   = useState(false);
+
+  const [workspaceWidth, setWorkspaceWidth] = useState(1080);
+  const [workspaceHeight, setWorkspaceHeight] = useState(1080);
+  const [workspaceTransparent, setWorkspaceTransparent] = useState(true);
+
+  const displayRef   = useRef<HTMLCanvasElement>(null);
+  const overlayRef   = useRef<HTMLCanvasElement>(null);
+  const hiddenVideoRef = useRef<HTMLVideoElement>(null);
+
+  const origRef      = useRef(document.createElement('canvas'));
+  const tempRef      = useRef(document.createElement('canvas'));
+  const scratchRef   = useRef(document.createElement('canvas'));
+  const selMaskRef   = useRef(document.createElement('canvas'));
+  const layerDataRef = useRef<Map<string, { effect: HTMLCanvasElement; mask: HTMLCanvasElement }>>(new Map());
+
+  const lastPtRef    = useRef<{ x: number; y: number } | null>(null);
+  const objUrlRef    = useRef<string | null>(null);
+  const rafRef       = useRef<number | null>(null);
+  const lastVidRenderRef = useRef(0);
+  const antsRef      = useRef(0);
+  const fpsRef       = useRef(previewFps);
+  const recorderRef  = useRef<MediaRecorder | null>(null);
+  const recStreamRef = useRef<MediaStream | null>(null);
+  const recChunksRef = useRef<Blob[]>([]);
+
+  const layersRef    = useRef(layers);
+  const selShapesRef = useRef(selectionShapes);
+  const draftRef     = useRef(draftSelection);
+  const penPathRef   = useRef(penPath);
+  const penActiveRef = useRef(penActiveIdx);
+  const penHoverRef  = useRef(penHoverIdx);
+  const penDragRef   = useRef(penDragInfo);
+  const lassoRef     = useRef(lassoPoints);
+
+  useEffect(() => { layersRef.current = layers; }, [layers]);
+  useEffect(() => { selShapesRef.current = selectionShapes; }, [selectionShapes]);
+  useEffect(() => { draftRef.current = draftSelection; }, [draftSelection]);
+  useEffect(() => { fpsRef.current = previewFps; }, [previewFps]);
+  useEffect(() => { penPathRef.current = penPath; }, [penPath]);
+  useEffect(() => { penActiveRef.current = penActiveIdx; }, [penActiveIdx]);
+  useEffect(() => { penHoverRef.current = penHoverIdx; }, [penHoverIdx]);
+  useEffect(() => { penDragRef.current = penDragInfo; }, [penDragInfo]);
+  useEffect(() => { lassoRef.current = lassoPoints; }, [lassoPoints]);
+
+  const selectedLayer = layers.find(l => l.id === selectedLayerId) ?? null;
+  const hasSelection  = selectionActive;
+  const canPaint      = !!selectedLayer && selectedLayer.useMask && (tool === 'brush' || tool === 'erase');
+
+  /* ── buffer helpers ── */
+  const ensureLayerBuffers = useCallback((id: string) => {
+    const W = Math.max(1, origRef.current.width);
+    const H = Math.max(1, origRef.current.height);
+    if (!layerDataRef.current.has(id)) {
+      const effect = document.createElement('canvas');
+      const mask   = document.createElement('canvas');
+      effect.width = W; effect.height = H;
+      mask.width   = W; mask.height   = H;
+      layerDataRef.current.set(id, { effect, mask });
+    }
+    const d = layerDataRef.current.get(id)!;
+    ensureSize(d.effect, W, H);
+    ensureSize(d.mask,   W, H);
+    return d;
+  }, [selectionActive]);
+
+  const clearSelMask = useCallback(() => {
+    const c = selMaskRef.current;
+    const ctx = c.getContext('2d');
+    if (ctx) ctx.clearRect(0, 0, c.width, c.height);
+    setSelectionActive(false);
+  }, []);
+
+  const refreshSelectionActive = useCallback(() => {
+    const c = selMaskRef.current;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    if (!ctx || !c.width || !c.height) {
+      setSelectionActive(false);
+      return;
+    }
+    const { data } = ctx.getImageData(0, 0, c.width, c.height);
+    for (let i = 3; i < data.length; i += 4) {
+      if (data[i] > 8) {
+        setSelectionActive(true);
+        return;
+      }
+    }
+    setSelectionActive(false);
+  }, []);
+
+  /* ── marching ants overlay ── */
+  const redrawOverlay = useCallback(() => {
+    const overlay = overlayRef.current;
+    const W = origRef.current.width;
+    const H = origRef.current.height;
+    if (!overlay || !W || !H) return;
+    ensureSize(overlay, W, H);
+    const ctx = overlay.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, W, H);
+
+    const shapes = selShapesRef.current;
+    const draft  = draftRef.current;
+
+    if (selectionActive) {
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.drawImage(selMaskRef.current, 0, 0);
+      ctx.restore();
+    }
+
+    const drawAnts = (shape: SelectionShape, light = '#fff') => {
+      ctx.save();
+      drawSelectionPath(ctx, shape);
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([6, 6]);
+      ctx.lineDashOffset = -antsRef.current;
+      ctx.strokeStyle = light;
+      ctx.stroke();
+      ctx.lineDashOffset = -(antsRef.current + 6);
+      ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+      ctx.stroke();
+      ctx.restore();
+    };
+
+    shapes.forEach(s => drawAnts(s, s.combine === 'subtract' ? '#aaa' : '#fff'));
+
+    if (draft) {
+      const ds = draftToShape(draft);
+      ctx.save();
+      drawSelectionPath(ctx, ds);
+      ctx.fillStyle = 'rgba(255,255,255,0.06)';
+      ctx.fill();
+      ctx.restore();
+      drawAnts(ds as SelectionShape, '#ccc');
+    }
+
+    // Draw lasso points
+    const lassoPts = lassoRef.current;
+    if (lassoPts.length > 1) {
+      ctx.save();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([4, 4]);
+      ctx.lineDashOffset = -antsRef.current;
+      ctx.beginPath();
+      ctx.moveTo(lassoPts[0].x, lassoPts[0].y);
+      for (let i = 1; i < lassoPts.length; i++) ctx.lineTo(lassoPts[i].x, lassoPts[i].y);
+      ctx.stroke();
+      // Show closing line ghost
+      ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+      ctx.beginPath();
+      ctx.moveTo(lassoPts[lassoPts.length - 1].x, lassoPts[lassoPts.length - 1].y);
+      ctx.lineTo(lassoPts[0].x, lassoPts[0].y);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // Draw pen path
+    const pp = penPathRef.current;
+    if (pp.points.length > 0) {
+      const dispCanvas = displayRef.current;
+      const scaleX = dispCanvas && dispCanvas.clientWidth > 0 ? W / dispCanvas.clientWidth : 1;
+      drawPenPathUI(ctx, pp, penActiveRef.current, penHoverRef.current, 1 / scaleX);
+    }
+
+    // Draw magic wand / smart crosshair if those tools are active
+    // (no extra overlay needed — selection mask handles it)
+  }, [selectionActive]);
+
+  /* ── composite ── */
+  const composite = useCallback(() => {
+    const output = displayRef.current;
+    const src    = origRef.current;
+    if (!output || !src.width || !src.height) return;
+    ensureSize(output, src.width, src.height);
+    ensureSize(tempRef.current, src.width, src.height);
+
+    const out  = output.getContext('2d')!;
+    const temp = tempRef.current.getContext('2d')!;
+
+    out.clearRect(0, 0, src.width, src.height);
+    out.drawImage(src, 0, 0);
+
+    for (const layer of layersRef.current) {
+      if (!layer.enabled) continue;
+      const d = layerDataRef.current.get(layer.id);
+      if (!d) continue;
+
+      temp.clearRect(0, 0, src.width, src.height);
+      temp.globalCompositeOperation = 'source-over';
+      temp.globalAlpha = 1;
+      temp.drawImage(d.effect, 0, 0);
+
+      temp.globalCompositeOperation = 'destination-in';
+      temp.drawImage(src, 0, 0);
+
+      if (layer.useMask) {
+        temp.globalCompositeOperation = 'destination-in';
+        temp.drawImage(d.mask, 0, 0);
+      }
+      temp.globalCompositeOperation = 'source-over';
+
+      out.save();
+      out.globalAlpha = layer.opacity;
+      out.globalCompositeOperation = layer.blendMode as GlobalCompositeOperation;
+      out.drawImage(tempRef.current, 0, 0);
+      out.restore();
+    }
+  }, []);
+
+  /* ── generate effect for one layer ── */
+  const generateEffect = useCallback((layer: EffectLayer) => {
+    const src = origRef.current;
+    if (!src.width || !src.height) return;
+    const { effect } = ensureLayerBuffers(layer.id);
+    ensureSize(effect, src.width, src.height);
+    const ctx = effect.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, effect.width, effect.height);
+
+    if (layer.type === 'dither') {
+      const s = layer.settings as DitherSettings;
+      const sw = Math.max(1, Math.floor(src.width  / s.pixelSize));
+      const sh = Math.max(1, Math.floor(src.height / s.pixelSize));
+      const sm = document.createElement('canvas');
+      sm.width = sw; sm.height = sh;
+      const sc = sm.getContext('2d', { willReadFrequently: true })!;
+      sc.drawImage(src, 0, 0, sw, sh);
+      const id = sc.getImageData(0, 0, sw, sh);
+      processDither(id, s.matrixSize, s.brightness, s.contrast, s.darkColor, s.lightColor);
+      sc.putImageData(id, 0, 0);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(sm, 0, 0, src.width, src.height);
+    } else if (layer.type === 'glow') {
+      const s = layer.settings as GlowSettings;
+      ctx.drawImage(processGlow(src, s.radius, s.intensity, s.threshold, s.color), 0, 0);
+    } else if (layer.type === 'halftone') {
+      const s = layer.settings as HalftoneSettings;
+      ctx.drawImage(processHalftone(src, s.cellSize, s.exposure, s.gamma, s.darkColor, s.lightColor), 0, 0);
+    } else if (layer.type === 'lego') {
+      const s = layer.settings as LegoSettings;
+      ctx.drawImage(processLego(src, s.brickSize, s.saturation, s.brightness, s.studOpacity, s.quantize, s.borderWidth), 0, 0);
+    } else if (layer.type === 'glitch') {
+      ctx.drawImage(processGlitch(src, layer.settings as GlitchSettings), 0, 0);
+    } else if (layer.type === 'chromatic') {
+      ctx.drawImage(processChromatic(src, layer.settings as ChromaticSettings), 0, 0);
+    } else if (layer.type === 'pixelate') {
+      ctx.drawImage(processPixelate(src, layer.settings as PixelateSettings), 0, 0);
+    } else if (layer.type === 'blur') {
+      ctx.drawImage(processBlur(src, layer.settings as BlurSettings), 0, 0);
+    } else if (layer.type === 'noise') {
+      ctx.drawImage(processNoise(src, layer.settings as NoiseSettings), 0, 0);
+    } else if (layer.type === 'vhs') {
+      ctx.drawImage(processVHS(src, layer.settings as VHSSettings), 0, 0);
+    } else if (layer.type === 'bloom') {
+      ctx.drawImage(processBloom(src, layer.settings as BloomSettings), 0, 0);
+    } else if (layer.type === 'emboss') {
+      ctx.drawImage(processEmboss(src, layer.settings as EmbossSettings), 0, 0);
+    } else if (layer.type === 'posterize') {
+      ctx.drawImage(processPosterize(src, layer.settings as PosterizeSettings), 0, 0);
+    } else if (layer.type === 'duotone') {
+      ctx.drawImage(processDuotone(src, layer.settings as DuotoneSettings), 0, 0);
+    } else if (layer.type === 'neon-glow') {
+      ctx.drawImage(processNeonGlow(src, layer.settings as NeonGlowSettings), 0, 0);
+    } else if (layer.type === 'motion-blur') {
+      ctx.drawImage(processMotionBlur(src, layer.settings as MotionBlurSettings), 0, 0);
+    } else if (layer.type === 'text-fill') {
+      ctx.drawImage(processTextFill(src, layer.settings as TextFillSettings), 0, 0);
+    }
+  }, [ensureLayerBuffers]);
+
+  const regenerateAll = useCallback(() => {
+    if (!origRef.current.width || !origRef.current.height) return;
+    layersRef.current.forEach(l => { ensureLayerBuffers(l.id); if (l.enabled) generateEffect(l); });
+    composite();
+    redrawOverlay();
+  }, [composite, ensureLayerBuffers, generateEffect, redrawOverlay]);
+
+  /* ── video loop ── */
+  const stopLoop = useCallback(() => {
+    if (rafRef.current !== null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+  }, []);
+
+  const renderVideoFrame = useCallback(() => {
+    const vid = hiddenVideoRef.current;
+    if (!vid || vid.readyState < 2) return;
+    const W = vid.videoWidth  || origRef.current.width;
+    const H = vid.videoHeight || origRef.current.height;
+    if (!W || !H) return;
+    ensureSize(origRef.current, W, H);
+    const ctx = origRef.current.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, W, H);
+    ctx.drawImage(vid, 0, 0, W, H);
+    setVideoCurrent(vid.currentTime || 0);
+    regenerateAll();
+  }, [regenerateAll]);
+
+  const startLoop = useCallback(() => {
+    stopLoop();
+    lastVidRenderRef.current = 0;
+    const tick = (t: number) => {
+      const vid = hiddenVideoRef.current;
+      if (!vid || vid.paused || vid.ended) { stopLoop(); setVideoPlaying(false); renderVideoFrame(); return; }
+      const gap = 1000 / Math.max(1, fpsRef.current);
+      if (t - lastVidRenderRef.current >= gap) { renderVideoFrame(); lastVidRenderRef.current = t; }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+  }, [renderVideoFrame, stopLoop]);
+
+  /* ── prepare source canvas ── */
+  const prepareSource = useCallback((W: number, H: number, draw: (ctx: CanvasRenderingContext2D) => void) => {
+    ensureSize(origRef.current, W, H);
+    ensureSize(tempRef.current, W, H);
+    ensureSize(scratchRef.current, W, H);
+    ensureSize(selMaskRef.current, W, H);
+    if (displayRef.current) ensureSize(displayRef.current, W, H);
+    if (overlayRef.current) ensureSize(overlayRef.current, W, H);
+
+    const ctx = origRef.current.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, W, H);
+    draw(ctx);
+
+    setMediaSize({ width: W, height: H });
+    setSourceHasAlpha(detectTransparency(origRef.current));
+
+    layerDataRef.current.clear();
+    clearSelMask();
+    setSelectionShapes([]); selShapesRef.current = [];
+    setDraftSelection(null); draftRef.current = null;
+    setPenPath({ id: uid(), points: [], closed: false });
+    setLassoPoints([]); lassoRef.current = [];
+
+    if (layersRef.current.length === 0) {
+      const base = defaultDither();
+      setLayers([base]); setSelectedLayerId(base.id);
+    } else {
+      layersRef.current.forEach(l => ensureLayerBuffers(l.id));
+    }
+
+    setSourceReady(true);
+    redrawOverlay();
+
+    if (layersRef.current.length > 0) regenerateAll(); else composite();
+  }, [clearSelMask, composite, ensureLayerBuffers, redrawOverlay, regenerateAll]);
+
+  const loadSourceFile = useCallback((file: File) => {
+    stopLoop();
+    if (recorderRef.current?.state === 'recording') recorderRef.current.stop();
+    setVideoPlaying(false);
+    if (objUrlRef.current) { URL.revokeObjectURL(objUrlRef.current); objUrlRef.current = null; }
+    const url = URL.createObjectURL(file);
+    objUrlRef.current = url;
+    setSourceName(file.name);
+    setSourceReady(false);
+    setSourceKind(file.type.startsWith('video/') ? 'video' : 'image');
+    setSourceUrl(url);
+    setIsWorkspaceSource(false);
+  }, [stopLoop]);
+
+  const insertImageIntoWorkspace = useCallback((file: Blob, fileName = 'pasted-image.png') => {
+    if (!sourceReady || !isWorkspaceSource || sourceKind !== 'image') {
+      if (file instanceof File) loadSourceFile(file);
+      return;
+    }
+
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const ctx = origRef.current.getContext('2d');
+      if (!ctx) {
+        URL.revokeObjectURL(url);
+        return;
+      }
+      const fitted = fitRect(img.naturalWidth, img.naturalHeight, origRef.current.width, origRef.current.height, false);
+      ctx.save();
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(img, fitted.x, fitted.y, fitted.w, fitted.h);
+      ctx.restore();
+      setSourceHasAlpha(detectTransparency(origRef.current));
+      setSourceName(prev => prev || fileName);
+      regenerateAll();
+      URL.revokeObjectURL(url);
+    };
+    img.onerror = () => URL.revokeObjectURL(url);
+    img.src = url;
+  }, [isWorkspaceSource, loadSourceFile, regenerateAll, sourceKind, sourceReady]);
+
+  const handleUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    loadSourceFile(file);
+    e.target.value = '';
+  };
+
+  const createWorkspace = () => {
+    const w = Math.max(64, Math.min(8192, Math.round(workspaceWidth)));
+    const h = Math.max(64, Math.min(8192, Math.round(workspaceHeight)));
+    stopLoop();
+    setVideoPlaying(false);
+    setSourceKind('image');
+    setSourceName(`workspace-${w}x${h}.png`);
+    setSourceUrl(null);
+    setIsWorkspaceSource(true);
+    prepareSource(w, h, ctx => {
+      if (!workspaceTransparent) {
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, w, h);
+      }
+    });
+  };
+
+  /* ── source url → canvas ── */
+  useEffect(() => {
+    if (!sourceUrl || !sourceKind) return;
+    stopLoop();
+    setVideoPlaying(false); setVideoDuration(0); setVideoCurrent(0); setSourceReady(false);
+
+    if (sourceKind === 'image') {
+      setIsWorkspaceSource(false);
+      const img = new Image();
+      img.onload = () => prepareSource(img.naturalWidth, img.naturalHeight, ctx => ctx.drawImage(img, 0, 0));
+      img.src = sourceUrl;
+      return () => { img.onload = null; };
+    }
+
+    const vid = hiddenVideoRef.current;
+    if (!vid) return;
+
+    const onLoaded = () => {
+      setIsWorkspaceSource(false);
+      const W = vid.videoWidth || 1, H = vid.videoHeight || 1;
+      prepareSource(W, H, ctx => ctx.drawImage(vid, 0, 0, W, H));
+      setVideoDuration(vid.duration || 0);
+      setVideoCurrent(vid.currentTime || 0);
+      setSourceHasAlpha(false);
+    };
+    const onPlay    = () => { setVideoPlaying(true);  startLoop(); };
+    const onPause   = () => { setVideoPlaying(false); stopLoop(); renderVideoFrame(); };
+    const onEnded   = () => { setVideoPlaying(false); stopLoop(); renderVideoFrame(); if (recorderRef.current?.state === 'recording') recorderRef.current.stop(); };
+
+    vid.addEventListener('loadeddata', onLoaded);
+    vid.addEventListener('play', onPlay);
+    vid.addEventListener('pause', onPause);
+    vid.addEventListener('ended', onEnded);
+    vid.src = sourceUrl;
+    vid.load();
+
+    return () => {
+      vid.pause(); stopLoop();
+      vid.removeEventListener('loadeddata', onLoaded);
+      vid.removeEventListener('play', onPlay);
+      vid.removeEventListener('pause', onPause);
+      vid.removeEventListener('ended', onEnded);
+    };
+  }, [prepareSource, renderVideoFrame, sourceKind, sourceUrl, startLoop, stopLoop]);
+
+  /* ── regenerate on layer settings change ── */
+  useEffect(() => {
+    if (!sourceReady) return;
+    const t = window.setTimeout(() => {
+      layersRef.current.forEach(l => ensureLayerBuffers(l.id));
+      regenerateAll();
+    }, 35);
+    return () => window.clearTimeout(t);
+  }, [ensureLayerBuffers, layers, regenerateAll, sourceReady]);
+
+  /* ── overlay refresh ── */
+  useEffect(() => { redrawOverlay(); }, [draftSelection, redrawOverlay, selectionShapes, sourceReady, tool, penPath, penActiveIdx, penHoverIdx, lassoPoints]);
+
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const items = Array.from(e.clipboardData?.items || []);
+      const imageItem = items.find(item => item.type.startsWith('image/'));
+      if (!imageItem) return;
+      const blob = imageItem.getAsFile();
+      if (!blob) return;
+      e.preventDefault();
+      insertImageIntoWorkspace(blob, 'pasted-image.png');
+    };
+
+    const onDragOver = (e: DragEvent) => {
+      const files = Array.from(e.dataTransfer?.files || []);
+      if (!files.some(file => file.type.startsWith('image/') || file.type.startsWith('video/'))) return;
+      e.preventDefault();
+      setIsDropTargetActive(true);
+    };
+
+    const onDragLeave = (e: DragEvent) => {
+      if (e.relatedTarget) return;
+      setIsDropTargetActive(false);
+    };
+
+    const onDrop = (e: DragEvent) => {
+      const files = Array.from(e.dataTransfer?.files || []);
+      const file = files.find(f => f.type.startsWith('image/') || f.type.startsWith('video/'));
+      if (!file) return;
+      e.preventDefault();
+      setIsDropTargetActive(false);
+      if (isWorkspaceSource && sourceReady && sourceKind === 'image' && file.type.startsWith('image/')) {
+        insertImageIntoWorkspace(file, file.name);
+      } else {
+        loadSourceFile(file);
+      }
+    };
+
+    window.addEventListener('paste', onPaste);
+    window.addEventListener('dragover', onDragOver);
+    window.addEventListener('dragleave', onDragLeave);
+    window.addEventListener('drop', onDrop);
+    return () => {
+      window.removeEventListener('paste', onPaste);
+      window.removeEventListener('dragover', onDragOver);
+      window.removeEventListener('dragleave', onDragLeave);
+      window.removeEventListener('drop', onDrop);
+    };
+  }, [insertImageIntoWorkspace, isWorkspaceSource, loadSourceFile, sourceKind, sourceReady]);
+
+  /* ── marching ants animation ── */
+  useEffect(() => {
+    const iv = window.setInterval(() => { antsRef.current = (antsRef.current + 1) % 12; redrawOverlay(); }, 80);
+    return () => window.clearInterval(iv);
+  }, [redrawOverlay]);
+
+  /* ── cleanup ── */
+  useEffect(() => {
+    return () => {
+      stopLoop();
+      if (recorderRef.current?.state === 'recording') recorderRef.current.stop();
+      if (objUrlRef.current) URL.revokeObjectURL(objUrlRef.current);
+      recStreamRef.current?.getTracks().forEach(t => t.stop());
+    };
+  }, [stopLoop]);
+
+  /* ─── layer management ─── */
+  const addLayer = (type: LayerType) => {
+    const factories: Record<LayerType, () => EffectLayer> = {
+      dither: defaultDither, glow: defaultGlow, halftone: defaultHalftone, lego: defaultLego,
+      glitch: defaultGlitch, chromatic: defaultChromatic, pixelate: defaultPixelate, blur: defaultBlur,
+      noise: defaultNoise, vhs: defaultVHS, bloom: defaultBloom, emboss: defaultEmboss,
+      posterize: defaultPosterize, duotone: defaultDuotone,
+      'neon-glow': defaultNeonGlow, 'motion-blur': defaultMotionBlur, 'text-fill': defaultTextFill,
+    };
+    const l = (factories[type] || defaultDither)();
+    setLayers(prev => [...prev, l]);
+    setSelectedLayerId(l.id);
+  };
+
+  const removeLayer = (id: string) => {
+    const cur = layersRef.current;
+    const idx = cur.findIndex(l => l.id === id);
+    const next = cur.filter(l => l.id !== id);
+    layerDataRef.current.delete(id);
+    setLayers(next);
+    if (selectedLayerId === id) {
+      const rep = next[Math.max(0, Math.min(idx - 1, next.length - 1))] ?? next[next.length - 1] ?? null;
+      setSelectedLayerId(rep?.id ?? null);
+    }
+  };
+
+  const moveLayer = (id: string, dir: 1 | -1) => {
+    setLayers(prev => {
+      const i = prev.findIndex(l => l.id === id);
+      const ni = i + dir;
+      if (i === -1 || ni < 0 || ni >= prev.length) return prev;
+      const n = [...prev]; [n[i], n[ni]] = [n[ni], n[i]]; return n;
+    });
+  };
+
+  const patchLayer = (id: string, up: Partial<EffectLayer>) =>
+    setLayers(prev => prev.map(l => l.id === id ? { ...l, ...up } : l));
+
+  const patchSettings = (id: string, up: Record<string, unknown>) =>
+    setLayers(prev => prev.map(l => l.id === id ? { ...l, settings: { ...l.settings, ...up } } : l));
+
+  const chooseTool = (next: ToolMode) => {
+    setTool(next);
+    if ((next === 'brush' || next === 'erase') && selectedLayerId) patchLayer(selectedLayerId, { useMask: true });
+    if (next !== 'lasso' && lassoPoints.length > 0) { setLassoPoints([]); lassoRef.current = []; }
+    if (next !== 'pen' && penDragRef.current) { setPenDragInfo(null); penDragRef.current = null; }
+    if (next !== 'select-rect' && next !== 'select-ellipse') { setDraftSelection(null); draftRef.current = null; }
+  };
+
+  const clearMask = () => {
+    if (!selectedLayerId) return;
+    const d = ensureLayerBuffers(selectedLayerId);
+    const ctx = d.mask.getContext('2d');
+    if (ctx) ctx.clearRect(0, 0, d.mask.width, d.mask.height);
+    composite();
+  };
+
+  const fillMask = () => {
+    if (!selectedLayerId) return;
+    const d = ensureLayerBuffers(selectedLayerId);
+    const ctx = d.mask.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, d.mask.width, d.mask.height);
+    ctx.fillStyle = 'white'; ctx.fillRect(0, 0, d.mask.width, d.mask.height);
+    composite();
+  };
+
+  const clearSelection = () => {
+    clearSelMask(); setSelectionShapes([]); selShapesRef.current = [];
+    setDraftSelection(null); draftRef.current = null;
+    setLassoPoints([]); lassoRef.current = [];
+    redrawOverlay();
+  };
+
+  const selectAll = () => {
+    if (!origRef.current.width || !origRef.current.height) return;
+    clearSelMask();
+    const ctx = selMaskRef.current.getContext('2d');
+    if (!ctx) return;
+    ctx.fillStyle = 'white'; ctx.fillRect(0, 0, selMaskRef.current.width, selMaskRef.current.height);
+    const shape: SelectionShape = { id: uid(), type: 'rect', combine: 'replace', x: 0, y: 0, w: origRef.current.width, h: origRef.current.height };
+    setSelectionShapes([shape]); selShapesRef.current = [shape]; redrawOverlay();
+    setSelectionActive(true);
+  };
+
+  const commitDraft = (draft: DraftSelection) => {
+    const shape = draftToShape(draft);
+    if (shape.w < 3 || shape.h < 3) return;
+    const canvas = selMaskRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    if (draft.combine === 'replace') ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.save();
+    ctx.fillStyle = 'white';
+    ctx.globalCompositeOperation = draft.combine === 'subtract' ? 'destination-out' : 'source-over';
+    drawSelectionPath(ctx, shape);
+    ctx.fill();
+    ctx.restore();
+    const next = draft.combine === 'replace' ? [{ ...shape, id: uid() }] : [...selShapesRef.current, { ...shape, id: uid() }];
+    setSelectionShapes(next); selShapesRef.current = next;
+    refreshSelectionActive();
+  };
+
+  /* ── Apply canvas mask to selection ── */
+  const applyMaskCanvasToSelection = useCallback((maskCanvas: HTMLCanvasElement, combine: SelectionCombine) => {
+    const canvas = selMaskRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    if (combine === 'replace') ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.save();
+    ctx.globalCompositeOperation = combine === 'subtract' ? 'destination-out' : 'source-over';
+    ctx.drawImage(maskCanvas, 0, 0);
+    ctx.restore();
+    ctx.globalCompositeOperation = 'source-over';
+    setSelectionShapes([]); selShapesRef.current = [];
+    refreshSelectionActive();
+    redrawOverlay();
+  }, [redrawOverlay, refreshSelectionActive]);
+
+  /* ── Pen path to selection ── */
+  const penPathToSelection = useCallback(() => {
+    const pp = penPathRef.current;
+    if (pp.points.length < 3 || !pp.closed) return;
+    const W = origRef.current.width, H = origRef.current.height;
+    if (!W || !H) return;
+    const tmpCanvas = document.createElement('canvas');
+    tmpCanvas.width = W; tmpCanvas.height = H;
+    const ctx = tmpCanvas.getContext('2d')!;
+    ctx.fillStyle = 'white';
+    const path2d = penPathToPath2D(pp);
+    ctx.fill(path2d);
+    applyMaskCanvasToSelection(tmpCanvas, selectionMode);
+  }, [applyMaskCanvasToSelection, selectionMode]);
+
+  /* ── Lasso to selection ── */
+  const lassoToSelection = useCallback(() => {
+    const pts = lassoRef.current;
+    if (pts.length < 3) return;
+    const W = origRef.current.width, H = origRef.current.height;
+    if (!W || !H) return;
+    const tmpCanvas = document.createElement('canvas');
+    tmpCanvas.width = W; tmpCanvas.height = H;
+    const ctx = tmpCanvas.getContext('2d')!;
+    ctx.fillStyle = 'white';
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.closePath();
+    ctx.fill();
+    applyMaskCanvasToSelection(tmpCanvas, selectionMode);
+    setLassoPoints([]); lassoRef.current = [];
+  }, [applyMaskCanvasToSelection, selectionMode]);
+
+  const applySelToMask = (mode: 'replace' | 'add' | 'subtract') => {
+    if (!selectedLayerId || !hasSelection) return;
+    const d = ensureLayerBuffers(selectedLayerId);
+    const ctx = d.mask.getContext('2d');
+    if (!ctx) return;
+    patchLayer(selectedLayerId, { useMask: true });
+    if (mode === 'replace') { ctx.clearRect(0, 0, d.mask.width, d.mask.height); ctx.globalCompositeOperation = 'source-over'; ctx.drawImage(selMaskRef.current, 0, 0); }
+    else if (mode === 'add') { ctx.globalCompositeOperation = 'source-over'; ctx.drawImage(selMaskRef.current, 0, 0); }
+    else { ctx.globalCompositeOperation = 'destination-out'; ctx.drawImage(selMaskRef.current, 0, 0); ctx.globalCompositeOperation = 'source-over'; }
+    ctx.globalCompositeOperation = 'source-over';
+    composite();
+  };
+
+  /* ── pointer events ── */
+  const getCanvasPt = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const c = overlayRef.current || displayRef.current;
+    if (!c) return { x: 0, y: 0 };
+    const r = c.getBoundingClientRect();
+    return { x: (e.clientX - r.left) * (c.width / r.width), y: (e.clientY - r.top) * (c.height / r.height) };
+  };
+
+  const paintLine = (from: { x: number; y: number }, to: { x: number; y: number }) => {
+    if (!selectedLayerId) return;
+    const d = ensureLayerBuffers(selectedLayerId);
+    const sc = scratchRef.current;
+    ensureSize(sc, d.mask.width, d.mask.height);
+    const sCtx = sc.getContext('2d')!;
+    const mCtx = d.mask.getContext('2d')!;
+    sCtx.clearRect(0, 0, sc.width, sc.height);
+    sCtx.lineCap = 'round'; sCtx.lineJoin = 'round';
+    sCtx.lineWidth = brushSize; sCtx.strokeStyle = 'white';
+    sCtx.beginPath(); sCtx.moveTo(from.x, from.y); sCtx.lineTo(to.x, to.y); sCtx.stroke();
+    if (selectionActive) {
+      sCtx.globalCompositeOperation = 'destination-in';
+      sCtx.drawImage(selMaskRef.current, 0, 0);
+      sCtx.globalCompositeOperation = 'source-over';
+    }
+    if (tool === 'brush') { mCtx.globalCompositeOperation = 'source-over'; mCtx.drawImage(sc, 0, 0); }
+    else { mCtx.globalCompositeOperation = 'destination-out'; mCtx.drawImage(sc, 0, 0); mCtx.globalCompositeOperation = 'source-over'; }
+    composite();
+  };
+
+  /* ── Pen Tool pointer handlers ── */
+  const handlePenPointerDown = (pt: { x: number; y: number }, e: React.PointerEvent<HTMLCanvasElement>) => {
+    const pp = penPathRef.current;
+    const canvasW = origRef.current.width;
+    const dispEl = displayRef.current;
+    const pxThreshold = dispEl && dispEl.clientWidth > 0 ? (10 * canvasW / dispEl.clientWidth) : 10;
+
+    const hit = hitTestPenPath(pp, pt.x, pt.y, pxThreshold);
+
+    if (hit) {
+      if (hit.type === 'close') {
+        // Close the path
+        const closed = { ...pp, closed: true };
+        setPenPath(closed); penPathRef.current = closed;
+        setPenActiveIdx(0);
+        return;
+      }
+      // Start dragging anchor or handle
+      setPenDragInfo(hit); penDragRef.current = hit;
+      if (hit.type === 'anchor') setPenActiveIdx(hit.idx);
+      e.currentTarget.setPointerCapture(e.pointerId);
+      return;
+    }
+
+    if (pp.closed) {
+      // Path is closed — start a new path
+      const newPath: PenPath = { id: uid(), points: [createAnchor(pt.x, pt.y)], closed: false };
+      setPenPath(newPath); penPathRef.current = newPath;
+      setPenActiveIdx(0);
+      // Start dragging to create cpOut
+      setPenDragInfo({ type: 'cpOut', idx: 0 }); penDragRef.current = { type: 'cpOut', idx: 0 };
+      e.currentTarget.setPointerCapture(e.pointerId);
+      return;
+    }
+
+    // Add new point
+    const newPt = createAnchor(pt.x, pt.y);
+    const newPts = [...pp.points, newPt];
+    const newPath: PenPath = { ...pp, points: newPts };
+    const newIdx = newPts.length - 1;
+    setPenPath(newPath); penPathRef.current = newPath;
+    setPenActiveIdx(newIdx);
+    // Start drag to set cpOut handle
+    setPenDragInfo({ type: 'cpOut', idx: newIdx }); penDragRef.current = { type: 'cpOut', idx: newIdx };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const handlePenPointerMove = (pt: { x: number; y: number }) => {
+    const di = penDragRef.current;
+    const pp = penPathRef.current;
+
+    if (!di) {
+      // Hover detection
+      const canvasW = origRef.current.width;
+      const dispEl = displayRef.current;
+      const pxThreshold = dispEl && dispEl.clientWidth > 0 ? (10 * canvasW / dispEl.clientWidth) : 10;
+      const hit = hitTestPenPath(pp, pt.x, pt.y, pxThreshold);
+      const newHover = hit && hit.type === 'anchor' ? hit.idx : null;
+      if (newHover !== penHoverRef.current) { setPenHoverIdx(newHover); penHoverRef.current = newHover; }
+      return;
+    }
+
+    const pts = [...pp.points];
+
+    if (di.type === 'anchor') {
+      const ap = pts[di.idx];
+      pts[di.idx] = { ...ap, x: pt.x, y: pt.y };
+    } else if (di.type === 'cpOut') {
+      const ap = pts[di.idx];
+      const newCp = { x: pt.x - ap.x, y: pt.y - ap.y };
+      let updated = { ...ap, cpOut: newCp };
+      updated = mirrorHandle(updated, 'cpOut');
+      pts[di.idx] = updated;
+    } else if (di.type === 'cpIn') {
+      const ap = pts[di.idx];
+      const newCp = { x: pt.x - ap.x, y: pt.y - ap.y };
+      let updated = { ...ap, cpIn: newCp };
+      updated = mirrorHandle(updated, 'cpIn');
+      pts[di.idx] = updated;
+    }
+
+    const newPath = { ...pp, points: pts };
+    setPenPath(newPath); penPathRef.current = newPath;
+  };
+
+  const handlePenPointerUp = (e?: React.PointerEvent<HTMLCanvasElement>) => {
+    setPenDragInfo(null); penDragRef.current = null;
+    if (e) {
+      try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* noop */ }
+    }
+  };
+
+  /* ── Main pointer handlers ── */
+  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!sourceReady) return;
+    const pt = getCanvasPt(e);
+    lastPtRef.current = pt;
+    setIsPointerActive(true);
+
+    if (tool === 'pen') {
+      handlePenPointerDown(pt, e);
+      e.currentTarget.setPointerCapture(e.pointerId);
+      return;
+    }
+
+    if (tool === 'lasso') {
+      setLassoPoints([pt]);
+      lassoRef.current = [pt];
+      e.currentTarget.setPointerCapture(e.pointerId);
+      return;
+    }
+
+    if (tool === 'magic-wand') {
+      const result = magicWandSelect(origRef.current, pt.x, pt.y, wandTolerance, wandContiguous, wandEdgeSmooth);
+      applyMaskCanvasToSelection(result, selectionMode);
+      setIsPointerActive(false);
+      return;
+    }
+
+    if (tool === 'smart-object') {
+      const result = smartObjectSelect(origRef.current, pt.x, pt.y, smartSensitivity);
+      applyMaskCanvasToSelection(result, selectionMode);
+      setIsPointerActive(false);
+      return;
+    }
+
+    e.currentTarget.setPointerCapture(e.pointerId);
+    if (tool === 'brush' || tool === 'erase') { if (canPaint) paintLine(pt, pt); return; }
+    if (tool === 'select-rect' || tool === 'select-ellipse') {
+      setDraftSelection({ type: tool === 'select-rect' ? 'rect' : 'ellipse', combine: selectionMode, startX: pt.x, startY: pt.y, endX: pt.x, endY: pt.y });
+    }
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const pt = getCanvasPt(e);
+
+    if (tool === 'pen') {
+      handlePenPointerMove(pt);
+      if (penDragRef.current) return; // don't do other processing while dragging pen handle
+    }
+
+    if (!isPointerActive && tool !== 'pen') return;
+
+    if (tool === 'lasso' && isPointerActive) {
+      const last = lassoRef.current[lassoRef.current.length - 1];
+      if (last) {
+        const dx = pt.x - last.x;
+        const dy = pt.y - last.y;
+        if (dx * dx + dy * dy < 9) return;
+      }
+      const newPts = [...lassoRef.current, pt];
+      setLassoPoints(newPts); lassoRef.current = newPts;
+      return;
+    }
+
+    if ((tool === 'brush' || tool === 'erase') && canPaint) {
+      if (lastPtRef.current) paintLine(lastPtRef.current, pt);
+      lastPtRef.current = pt; return;
+    }
+    if ((tool === 'select-rect' || tool === 'select-ellipse') && draftRef.current) {
+      const nd = { ...draftRef.current, endX: pt.x, endY: pt.y };
+      draftRef.current = nd; setDraftSelection(nd);
+    }
+  };
+
+  const handlePointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    if (tool === 'pen') {
+      handlePenPointerUp(e);
+      setIsPointerActive(false);
+      return;
+    }
+
+    if (tool === 'lasso' && isPointerActive) {
+      lassoToSelection();
+      setIsPointerActive(false);
+      try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* noop */ }
+      return;
+    }
+
+    setIsPointerActive(false);
+    const ad = draftRef.current;
+    if ((tool === 'select-rect' || tool === 'select-ellipse') && ad) {
+      commitDraft(ad); setDraftSelection(null); draftRef.current = null; redrawOverlay();
+    }
+    lastPtRef.current = null;
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* noop */ }
+  };
+
+  /* ── Keyboard: delete pen anchor, Escape, Enter ── */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (tool === 'pen' && penActiveRef.current !== null) {
+          const pp = penPathRef.current;
+          const idx = penActiveRef.current;
+          if (pp.points.length > 0) {
+            const newPts = pp.points.filter((_: AnchorPoint, i: number) => i !== idx);
+            const newPath = { ...pp, points: newPts, closed: newPts.length < 3 ? false : pp.closed };
+            setPenPath(newPath); penPathRef.current = newPath;
+            setPenActiveIdx(newPts.length > 0 ? Math.min(idx, newPts.length - 1) : null);
+          }
+          e.preventDefault();
+        }
+      }
+      if (e.key === 'Escape') {
+        if (tool === 'pen') {
+          const resetPath = { id: uid(), points: [], closed: false };
+          setPenPath(resetPath);
+          penPathRef.current = resetPath;
+          setPenActiveIdx(null);
+        }
+        if (tool === 'lasso') {
+          setLassoPoints([]); lassoRef.current = [];
+        }
+        clearSelection();
+      }
+      if (e.key === 'Enter') {
+        if (tool === 'pen' && penPathRef.current.points.length >= 3) {
+          // Close and make selection
+          if (!penPathRef.current.closed) {
+            const closed = { ...penPathRef.current, closed: true };
+            setPenPath(closed); penPathRef.current = closed;
+          }
+          penPathToSelection();
+        }
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [tool, clearSelection, penPathToSelection, lassoToSelection]);
+
+  /* ── drag & drop layers ── */
+  const handleDragStart = (e: React.DragEvent, id: string) => { setDragId(id); e.dataTransfer.effectAllowed = 'move'; };
+  const handleDragOver  = (e: React.DragEvent, targetId: string) => {
+    e.preventDefault();
+    if (!dragId || dragId === targetId) return;
+    setLayers(prev => {
+      const di = prev.findIndex(l => l.id === dragId);
+      const ti = prev.findIndex(l => l.id === targetId);
+      if (di === -1 || ti === -1) return prev;
+      const n = [...prev]; const [dl] = n.splice(di, 1); n.splice(ti, 0, dl); return n;
+    });
+  };
+  const handleDragEnd = () => setDragId(null);
+
+  /* ── download ── */
+  const downloadFrame = () => {
+    if (!displayRef.current) return;
+    const a = document.createElement('a');
+    a.download = `${sanitizeFileBase(sourceName)}-processed.png`;
+    a.href = displayRef.current.toDataURL('image/png');
+    a.click();
+  };
+
+  /* ── video controls ── */
+  const togglePlay = async () => {
+    const v = hiddenVideoRef.current;
+    if (!v) return;
+    if (v.paused || v.ended) { if (v.ended) v.currentTime = 0; try { await v.play(); } catch { /**/ } }
+    else v.pause();
+  };
+
+  const seekVideo = (t: number) => {
+    const v = hiddenVideoRef.current;
+    if (!v) return;
+    v.currentTime = t; setVideoCurrent(t);
+    if (v.paused) window.setTimeout(() => renderVideoFrame(), 0);
+  };
+
+  const exportVideo = async () => {
+    const canvas = displayRef.current;
+    const vid    = hiddenVideoRef.current;
+    if (!canvas || !vid || typeof MediaRecorder === 'undefined') return;
+    if (isRecording) return;
+
+    const stream = canvas.captureStream(Math.max(12, fpsRef.current));
+    recStreamRef.current = stream;
+    recChunksRef.current = [];
+
+    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9'
+               : MediaRecorder.isTypeSupported('video/webm;codecs=vp8') ? 'video/webm;codecs=vp8'
+               : 'video/webm';
+
+    const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
+    recorderRef.current = rec;
+    rec.ondataavailable = ev => { if (ev.data.size > 0) recChunksRef.current.push(ev.data); };
+    rec.onstop = () => {
+      const blob = new Blob(recChunksRef.current, { type: mime });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href = url; a.download = `${sanitizeFileBase(sourceName)}-processed.webm`; a.click();
+      URL.revokeObjectURL(url);
+      recStreamRef.current?.getTracks().forEach(t => t.stop());
+      recStreamRef.current = null; recorderRef.current = null; setIsRecording(false);
+    };
+
+    setIsRecording(true);
+    vid.pause(); vid.currentTime = 0; renderVideoFrame();
+    rec.start();
+    try { await vid.play(); } catch { rec.stop(); setIsRecording(false); }
+  };
+
+  /* ── derived ── */
+  const dither     = selectedLayer?.type === 'dither'     ? selectedLayer.settings as DitherSettings     : null;
+  const glow       = selectedLayer?.type === 'glow'       ? selectedLayer.settings as GlowSettings       : null;
+  const halftone   = selectedLayer?.type === 'halftone'   ? selectedLayer.settings as HalftoneSettings   : null;
+  const lego       = selectedLayer?.type === 'lego'       ? selectedLayer.settings as LegoSettings       : null;
+  const glitchS    = selectedLayer?.type === 'glitch'     ? selectedLayer.settings as GlitchSettings     : null;
+  const chromaticS = selectedLayer?.type === 'chromatic'  ? selectedLayer.settings as ChromaticSettings  : null;
+  const pixelateS  = selectedLayer?.type === 'pixelate'   ? selectedLayer.settings as PixelateSettings   : null;
+  const blurS      = selectedLayer?.type === 'blur'       ? selectedLayer.settings as BlurSettings       : null;
+  const noiseS     = selectedLayer?.type === 'noise'      ? selectedLayer.settings as NoiseSettings      : null;
+  const vhsS       = selectedLayer?.type === 'vhs'        ? selectedLayer.settings as VHSSettings        : null;
+  const bloomS     = selectedLayer?.type === 'bloom'      ? selectedLayer.settings as BloomSettings      : null;
+  const embossS    = selectedLayer?.type === 'emboss'     ? selectedLayer.settings as EmbossSettings     : null;
+  const posterizeS = selectedLayer?.type === 'posterize'  ? selectedLayer.settings as PosterizeSettings  : null;
+  const duotoneS   = selectedLayer?.type === 'duotone'    ? selectedLayer.settings as DuotoneSettings    : null;
+  const neonS      = selectedLayer?.type === 'neon-glow'  ? selectedLayer.settings as NeonGlowSettings   : null;
+  const motionS    = selectedLayer?.type === 'motion-blur' ? selectedLayer.settings as MotionBlurSettings : null;
+  const textFillS  = selectedLayer?.type === 'text-fill'  ? selectedLayer.settings as TextFillSettings   : null;
+
+  const cursor = tool === 'brush' || tool === 'erase' ? 'crosshair'
+               : tool === 'select-rect' || tool === 'select-ellipse' ? 'cell'
+               : tool === 'pen' ? 'crosshair'
+               : tool === 'lasso' ? 'crosshair'
+               : tool === 'magic-wand' || tool === 'smart-object' ? 'crosshair'
+               : 'default';
+
+  /* ── render ── */
+  return (
+    <div className="flex h-screen overflow-hidden bg-black text-white select-none">
+
+      {/* ── Left sidebar ── */}
+      <aside className="flex h-full w-[300px] shrink-0 flex-col border-r border-[#1a1a1a]">
+
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-[#1a1a1a] shrink-0">
+          <div>
+            <div className="logo-text text-[22px] leading-none tracking-[-0.05em]">.eana studio</div>
+            <div className="text-[10px] text-[#444] font-medium tracking-[0.18em] uppercase mt-1">Effects Editor</div>
+          </div>
+          <div className="flex items-center gap-2">
+            {isWorkspaceSource && sourceReady && (
+              <span className="tag tag-white">Workspace</span>
+            )}
+            <label className="btn btn-solid text-[11px] px-3 py-1.5 cursor-pointer">
+              <Upload size={13} />
+              <span>{isWorkspaceSource && sourceReady ? 'Replace' : 'Open'}</span>
+              <input type="file" className="hidden" accept="image/*,video/*" onChange={handleUpload} />
+            </label>
+          </div>
+        </div>
+
+        {/* Scrollable content */}
+        <div className="flex-1 overflow-y-auto surface-scroll">
+
+          <div className="px-4 py-3 border-b border-[#1a1a1a]">
+            <div className="flex items-center gap-2 mb-2">
+              <Grid3X3 size={12} className="text-[#555]" />
+              <span className="text-[11px] text-[#555] font-medium tracking-wide uppercase">Workspace</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <label>
+                <div className="text-[10px] text-[#444] mb-1">Width</div>
+                <input
+                  type="number"
+                  min={64}
+                  max={8192}
+                  value={workspaceWidth}
+                  onChange={e => setWorkspaceWidth(parseInt(e.target.value || '0', 10) || 0)}
+                  className="field text-[12px] py-1.5"
+                />
+              </label>
+              <label>
+                <div className="text-[10px] text-[#444] mb-1">Height</div>
+                <input
+                  type="number"
+                  min={64}
+                  max={8192}
+                  value={workspaceHeight}
+                  onChange={e => setWorkspaceHeight(parseInt(e.target.value || '0', 10) || 0)}
+                  className="field text-[12px] py-1.5"
+                />
+              </label>
+            </div>
+            <label className="flex items-center gap-2 mt-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={workspaceTransparent}
+                onChange={e => setWorkspaceTransparent(e.target.checked)}
+                className="accent-white w-3.5 h-3.5"
+              />
+              <span className="text-[12px] text-[#666]">Transparent background</span>
+            </label>
+            <div className="grid grid-cols-3 gap-1 mt-2">
+              {[
+                [1080,1080],
+                [1920,1080],
+                [1080,1920],
+              ].map(([w, h]) => (
+                <button
+                  key={`${w}x${h}`}
+                  onClick={() => { setWorkspaceWidth(w); setWorkspaceHeight(h); }}
+                  className="btn btn-ghost text-[10px] py-1 px-2"
+                >
+                  {w}×{h}
+                </button>
+              ))}
+            </div>
+            <button onClick={createWorkspace} className="btn btn-ghost w-full mt-2 text-[11px] py-1.5">
+              Create Canvas
+            </button>
+            <div className="mt-2 text-[10px] leading-relaxed text-[#444]">
+              После создания холста можно перетаскивать фото в окно или вставлять через <kbd className="kbd">Ctrl</kbd> + <kbd className="kbd">V</kbd>.
+            </div>
+          </div>
+
+          {/* Media info */}
+          {sourceUrl && (
+            <div className="px-4 py-3 border-b border-[#1a1a1a]">
+              <div className="flex items-center gap-2 text-[11px] text-[#555]">
+                <span className="truncate flex-1 text-[#888]">{sourceName || '—'}</span>
+                {sourceKind && <span className="tag tag-white">{sourceKind}</span>}
+              </div>
+              <div className="flex flex-wrap gap-1.5 mt-2">
+                {mediaSize.width > 0 && (
+                  <span className="tag tag-white">{mediaSize.width}×{mediaSize.height}</span>
+                )}
+                {sourceHasAlpha && (
+                  <span className="tag tag-white">alpha</span>
+                )}
+                {sourceKind === 'video' && (
+                  <span className="tag tag-white">{formatTime(videoDuration)}</span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Video controls */}
+          {sourceKind === 'video' && sourceReady && (
+            <div className="px-4 py-3 border-b border-[#1a1a1a]">
+              <div className="flex items-center gap-2 mb-2">
+                <Film size={12} className="text-[#555]" />
+                <span className="text-[11px] text-[#555] font-medium tracking-wide uppercase">Video</span>
+                <div className="flex-1" />
+                <button onClick={togglePlay} className="btn btn-ghost text-[11px] px-2 py-1">
+                  {videoPlaying ? <Pause size={11} /> : <Play size={11} />}
+                  {videoPlaying ? 'Pause' : 'Play'}
+                </button>
+              </div>
+              <div className="space-y-2">
+                <SliderRow label="FPS Preview" value={previewFps} min={6} max={30} step={1} display={`${previewFps}`} onChange={setPreviewFps} />
+                <div>
+                  <div className="flex justify-between text-[10px] text-[#444] mb-1">
+                    <span>Timeline</span>
+                    <span>{formatTime(videoCurrent)} / {formatTime(videoDuration)}</span>
+                  </div>
+                  <input type="range" className="range-slim cursor-pointer" min={0} max={Math.max(0.001, videoDuration)} step={0.01}
+                    value={Math.min(videoCurrent, Math.max(0.001, videoDuration))}
+                    onChange={e => seekVideo(parseFloat(e.target.value))} />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Tools */}
+          <div className="border-b border-[#1a1a1a]">
+            <button
+              className="w-full flex items-center justify-between px-4 py-2.5 text-[10px] font-semibold tracking-[0.2em] uppercase text-[#444] hover:text-[#666] transition"
+              onClick={() => setSecTools(v => !v)}
+            >
+              Tools {secTools ? <Minus size={11} /> : <Plus size={11} />}
+            </button>
+            {secTools && (
+              <div className="px-4 pb-3 space-y-2 fade-in">
+
+                {/* Row 1: View / Brush / Erase */}
+                <SectionLabel>Paint</SectionLabel>
+                <div className="grid grid-cols-3 gap-1.5">
+                  <ToolBtn active={tool === 'none'} onClick={() => chooseTool('none')} label="View">
+                    <MousePointer size={12} />
+                  </ToolBtn>
+                  <ToolBtn active={tool === 'brush'} onClick={() => chooseTool('brush')} label="Brush">
+                    <Pen size={12} />
+                  </ToolBtn>
+                  <ToolBtn active={tool === 'erase'} onClick={() => chooseTool('erase')} label="Erase">
+                    <Eraser size={12} />
+                  </ToolBtn>
+                </div>
+
+                {(tool === 'brush' || tool === 'erase') && (
+                  <SliderRow label="Brush size" value={brushSize} min={4} max={320} step={1} display={`${brushSize}px`} onChange={setBrushSize} />
+                )}
+
+                <Divider />
+
+                {/* Row 2: Selection tools */}
+                <SectionLabel>Select</SectionLabel>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <ToolBtn active={tool === 'select-rect'} onClick={() => chooseTool('select-rect')} label="Rect">
+                    <Square size={12} />
+                  </ToolBtn>
+                  <ToolBtn active={tool === 'select-ellipse'} onClick={() => chooseTool('select-ellipse')} label="Ellipse">
+                    <Circle size={12} />
+                  </ToolBtn>
+                  <ToolBtn active={tool === 'lasso'} onClick={() => chooseTool('lasso')} label="Lasso">
+                    <Lasso size={12} />
+                  </ToolBtn>
+                  <ToolBtn active={tool === 'pen'} onClick={() => chooseTool('pen')} label="Pen">
+                    <Spline size={12} />
+                  </ToolBtn>
+                  <ToolBtn active={tool === 'magic-wand'} onClick={() => chooseTool('magic-wand')} label="Wand">
+                    <Wand2 size={12} />
+                  </ToolBtn>
+                  <ToolBtn active={tool === 'smart-object'} onClick={() => chooseTool('smart-object')} label="Smart">
+                    <Grid3X3 size={12} />
+                  </ToolBtn>
+                </div>
+
+                {/* Magic wand settings */}
+                {tool === 'magic-wand' && (
+                  <div className="space-y-2 pt-1 fade-in">
+                    <SliderRow label="Tolerance" value={wandTolerance} min={0} max={128} step={1} display={`${wandTolerance}`} onChange={setWandTolerance} />
+                    <SliderRow label="Edge Smooth" value={wandEdgeSmooth} min={0} max={5} step={1} display={`${wandEdgeSmooth}px`} onChange={setWandEdgeSmooth} />
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" checked={wandContiguous}
+                        onChange={e => setWandContiguous(e.target.checked)}
+                        className="accent-white w-3.5 h-3.5" />
+                      <span className="text-[12px] text-[#666]">Contiguous</span>
+                    </label>
+                  </div>
+                )}
+
+                {/* Smart object settings */}
+                {tool === 'smart-object' && (
+                  <div className="space-y-2 pt-1 fade-in">
+                    <SliderRow label="Sensitivity" value={smartSensitivity} min={0.05} max={0.9} step={0.01} display={smartSensitivity.toFixed(2)} onChange={setSmartSensitivity} />
+                  </div>
+                )}
+
+                {/* Pen tool info */}
+                {tool === 'pen' && (
+                  <div className="space-y-2 pt-1 fade-in">
+                    <div className="text-[11px] text-[#555] leading-relaxed">
+                      Click to add anchor points. Drag to create curves. Click first point to close. Press <kbd className="kbd">Enter</kbd> to convert to selection. Press <kbd className="kbd">Delete</kbd> to remove a point. <kbd className="kbd">Esc</kbd> to clear.
+                    </div>
+                    <div className="flex items-center gap-2 text-[11px] text-[#444]">
+                      <span>Points: {penPath.points.length}</span>
+                      {penPath.closed && <span className="tag tag-white">Closed</span>}
+                    </div>
+                    {penPath.closed && penPath.points.length >= 3 && (
+                      <button onClick={penPathToSelection} className="btn btn-ghost text-[11px] w-full py-1.5">
+                        Path → Selection
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {/* Lasso info */}
+                {tool === 'lasso' && (
+                  <div className="pt-1 fade-in">
+                    <div className="text-[11px] text-[#555] leading-relaxed">
+                      Click & drag to draw freehand selection area. Release to close and commit.
+                    </div>
+                  </div>
+                )}
+
+                <Divider />
+
+                {/* Selection mode */}
+                <SectionLabel>Selection Mode</SectionLabel>
+                <div className="flex gap-1">
+                  {(['replace','add','subtract'] as SelectionCombine[]).map(m => (
+                    <button key={m}
+                      onClick={() => setSelectionMode(m)}
+                      className={cn('flex-1 rounded text-[10px] py-1.5 border transition font-medium',
+                        selectionMode === m ? 'bg-white text-black border-white' : 'border-[#222] text-[#555] hover:text-white hover:border-[#444]'
+                      )}
+                    >
+                      {m === 'replace' ? 'New' : m === 'add' ? 'Add' : 'Sub'}
+                    </button>
+                  ))}
+                </div>
+
+                {hasSelection && (
+                  <div className="flex gap-1.5">
+                    <button onClick={selectAll} className="btn btn-ghost text-[11px] flex-1 py-1">All</button>
+                    <button onClick={clearSelection} className="btn btn-ghost text-[11px] flex-1 py-1">Clear sel.</button>
+                  </div>
+                )}
+
+                {selectedLayer?.useMask && hasSelection && (
+                  <div className="flex gap-1.5">
+                    <button onClick={() => applySelToMask('replace')} className="btn btn-ghost text-[11px] flex-1 py-1">Mask ← sel</button>
+                    <button onClick={() => applySelToMask('subtract')} className="btn btn-ghost text-[11px] flex-1 py-1">Cut mask</button>
+                  </div>
+                )}
+
+                {selectedLayer?.useMask && (
+                  <div className="flex gap-1.5">
+                    <button onClick={clearMask} className="btn btn-ghost text-[11px] flex-1 py-1">Clear mask</button>
+                    <button onClick={fillMask} className="btn btn-ghost text-[11px] flex-1 py-1 gap-1">
+                      <PaintBucket size={11} />Fill mask
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Layers */}
+          <div className="border-b border-[#1a1a1a]">
+            <button
+              className="w-full flex items-center justify-between px-4 py-2.5 text-[10px] font-semibold tracking-[0.2em] uppercase text-[#444] hover:text-[#666] transition"
+              onClick={() => setSecLayers(v => !v)}
+            >
+              <span className="flex items-center gap-2">
+                <Layers size={11} />
+                Layers
+                <span className="tag tag-white">{layers.length}</span>
+              </span>
+              {secLayers ? <Minus size={11} /> : <Plus size={11} />}
+            </button>
+
+            {secLayers && (
+              <div className="pb-2">
+                {/* Add layer buttons */}
+                <div className="flex flex-wrap gap-1 px-4 pb-2">
+                  {([
+                    ['dither','Dither'], ['glow','Glow'], ['halftone','Halftone'], ['lego','LEGO'],
+                    ['glitch','Glitch'], ['chromatic','Chroma'], ['pixelate','Pixel'],
+                    ['blur','Blur'], ['noise','Noise'], ['vhs','VHS'],
+                    ['bloom','Bloom'], ['emboss','Emboss'], ['posterize','Poster.'], ['duotone','Duotone'],
+                    ['neon-glow','Neon'], ['motion-blur','M.Blur'], ['text-fill','Text'],
+                  ] as [LayerType, string][]).map(([type, label]) => (
+                    <button
+                      key={type}
+                      onClick={() => addLayer(type)}
+                      disabled={!sourceReady}
+                      className="text-[10px] font-medium px-2 py-1 rounded border transition disabled:opacity-30 disabled:cursor-not-allowed hover:text-white hover:border-[#444]"
+                      style={{ borderColor: '#222', color: LAYER_COLORS[type] || '#666' }}
+                    >
+                      + {label}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Layer list */}
+                <div className="border-t border-[#1a1a1a]">
+                  {layers.length === 0 ? (
+                    <div className="px-4 py-5 text-center text-[11px] text-[#333]">Load media first</div>
+                  ) : (
+                    [...layers].reverse().map(layer => (
+                      <div
+                        key={layer.id}
+                        draggable
+                        onDragStart={e => handleDragStart(e, layer.id)}
+                        onDragOver={e => handleDragOver(e, layer.id)}
+                        onDragEnd={handleDragEnd}
+                        onClick={() => setSelectedLayerId(layer.id)}
+                        className={cn(
+                          'layer-row group flex items-center gap-2 px-3 py-2 text-[12px] cursor-pointer',
+                          selectedLayerId === layer.id && 'selected',
+                          dragId === layer.id && 'opacity-30'
+                        )}
+                      >
+                        <GripVertical size={12} className="text-[#2a2a2a] shrink-0" />
+
+                        <button
+                          onClick={e => { e.stopPropagation(); patchLayer(layer.id, { enabled: !layer.enabled }); }}
+                          className="shrink-0 text-[#333] hover:text-white transition"
+                        >
+                          {layer.enabled ? <Eye size={12} /> : <EyeOff size={12} />}
+                        </button>
+
+                        <LayerDot type={layer.type} />
+
+                        <span className={cn('flex-1 truncate font-medium', layer.enabled ? 'text-[#ccc]' : 'text-[#444]')}>
+                          {layer.name}
+                        </span>
+
+                        <span className="text-[10px] font-mono text-[#333] w-8 text-right shrink-0">
+                          {Math.round(layer.opacity * 100)}%
+                        </span>
+
+                        <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition shrink-0">
+                          <IconBtn onClick={e => { e.stopPropagation(); moveLayer(layer.id, 1); }} title="Move up"><ChevronUp size={11} /></IconBtn>
+                          <IconBtn onClick={e => { e.stopPropagation(); moveLayer(layer.id, -1); }} title="Move down"><ChevronDown size={11} /></IconBtn>
+                          <IconBtn onClick={e => { e.stopPropagation(); removeLayer(layer.id); }} title="Delete">
+                            <Trash2 size={11} className="hover:text-red-400" />
+                          </IconBtn>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Inspector */}
+          {selectedLayer && (
+            <div className="border-b border-[#1a1a1a]">
+              <button
+                className="w-full flex items-center justify-between px-4 py-2.5 text-[10px] font-semibold tracking-[0.2em] uppercase text-[#444] hover:text-[#666] transition"
+                onClick={() => setSecInspect(v => !v)}
+              >
+                Inspector {secInspect ? <Minus size={11} /> : <Plus size={11} />}
+              </button>
+
+              {secInspect && (
+                <div className="px-4 pb-4 space-y-3 fade-in">
+                  {/* Layer name */}
+                  <div className="flex items-center gap-2">
+                    <LayerDot type={selectedLayer.type} />
+                    <input
+                      value={selectedLayer.name}
+                      onChange={e => patchLayer(selectedLayer.id, { name: e.target.value })}
+                      className="field text-[13px]"
+                    />
+                  </div>
+
+                  {/* Blend + opacity */}
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <div className="text-[10px] text-[#444] mb-1 font-medium">Blend</div>
+                      <select
+                        value={selectedLayer.blendMode}
+                        onChange={e => patchLayer(selectedLayer.id, { blendMode: e.target.value as BlendMode })}
+                        className="field text-[12px] py-1.5"
+                      >
+                        {BLEND_MODES.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <div className="text-[10px] text-[#444] mb-1 font-medium">Opacity</div>
+                      <div className="flex items-center gap-2">
+                        <input type="range" className="range-slim cursor-pointer flex-1"
+                          min={0} max={1} step={0.01} value={selectedLayer.opacity}
+                          onChange={e => patchLayer(selectedLayer.id, { opacity: parseFloat(e.target.value) })} />
+                        <span className="text-[11px] font-mono text-[#555] w-8 text-right shrink-0">
+                          {Math.round(selectedLayer.opacity * 100)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Mask toggle */}
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="checkbox" checked={selectedLayer.useMask}
+                      onChange={e => patchLayer(selectedLayer.id, { useMask: e.target.checked })}
+                      className="accent-white w-3.5 h-3.5" />
+                    <span className="text-[12px] text-[#666]">Use layer mask</span>
+                  </label>
+
+                  <Divider />
+
+                  <button
+                    onClick={() => setSecEffects(v => !v)}
+                    className="w-full flex items-center justify-between text-left"
+                  >
+                    <SectionLabel>Effect Settings</SectionLabel>
+                    <span className="text-[#555]">{secEffects ? <Minus size={11} /> : <Plus size={11} />}</span>
+                  </button>
+
+                  <div className={cn('fx-collapse', secEffects ? 'open' : 'closed')}>
+                    <div className="space-y-3 pt-1">
+
+                  {/* ── Dither ── */}
+                  {dither && (
+                    <div className="space-y-3">
+                      <SliderRow label="Pixel Size" value={dither.pixelSize} min={1} max={10} step={1} display={`${dither.pixelSize}x`}
+                        onChange={v => patchSettings(selectedLayer.id, { pixelSize: v })} />
+                      <SliderRow label="Matrix" value={dither.matrixSize} min={2} max={8} step={2} display={`${dither.matrixSize}×${dither.matrixSize}`}
+                        onChange={v => patchSettings(selectedLayer.id, { matrixSize: Math.round(v) === 6 ? 8 : Math.round(v) })} />
+                      <SliderRow label="Brightness" value={dither.brightness} min={-100} max={100} step={1} display={`${dither.brightness}`}
+                        onChange={v => patchSettings(selectedLayer.id, { brightness: v })} />
+                      <SliderRow label="Contrast" value={dither.contrast} min={-100} max={100} step={1} display={`${dither.contrast}`}
+                        onChange={v => patchSettings(selectedLayer.id, { contrast: v })} />
+                      <div className="grid grid-cols-2 gap-3">
+                        <label>
+                          <div className="text-[10px] text-[#444] mb-1">Dark color</div>
+                          <input type="color" value={dither.darkColor}
+                            onChange={e => patchSettings(selectedLayer.id, { darkColor: e.target.value })}
+                            className="w-full h-8 cursor-pointer rounded bg-transparent border border-[#222]" />
+                        </label>
+                        <label>
+                          <div className="text-[10px] text-[#444] mb-1">Light color</div>
+                          <input type="color" value={dither.lightColor}
+                            onChange={e => patchSettings(selectedLayer.id, { lightColor: e.target.value })}
+                            className="w-full h-8 cursor-pointer rounded bg-transparent border border-[#222]" />
+                        </label>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── Glow ── */}
+                  {glow && (
+                    <div className="space-y-3">
+                      <SliderRow label="Blur Radius" value={glow.radius} min={1} max={60} step={1} display={`${glow.radius}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { radius: v })} />
+                      <SliderRow label="Intensity" value={glow.intensity} min={0} max={3} step={0.05} display={glow.intensity.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { intensity: v })} />
+                      <SliderRow label="Threshold" value={glow.threshold} min={0} max={255} step={1} display={`${glow.threshold}`}
+                        onChange={v => patchSettings(selectedLayer.id, { threshold: v })} />
+                      <label>
+                        <div className="text-[10px] text-[#444] mb-1">Glow color</div>
+                        <input type="color" value={glow.color}
+                          onChange={e => patchSettings(selectedLayer.id, { color: e.target.value })}
+                          className="w-full h-8 cursor-pointer rounded bg-transparent border border-[#222]" />
+                      </label>
+                    </div>
+                  )}
+
+                  {/* ── Halftone ── */}
+                  {halftone && (
+                    <div className="space-y-3">
+                      <SliderRow label="Cell Size" value={halftone.cellSize} min={3} max={30} step={1} display={`${halftone.cellSize}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { cellSize: v })} />
+                      <SliderRow label="Exposure" value={halftone.exposure} min={0.4} max={2.5} step={0.01} display={halftone.exposure.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { exposure: v })} />
+                      <SliderRow label="Gamma" value={halftone.gamma} min={0.4} max={2.5} step={0.01} display={halftone.gamma.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { gamma: v })} />
+                      <div className="grid grid-cols-2 gap-3">
+                        <label>
+                          <div className="text-[10px] text-[#444] mb-1">Dot color</div>
+                          <input type="color" value={halftone.darkColor}
+                            onChange={e => patchSettings(selectedLayer.id, { darkColor: e.target.value })}
+                            className="w-full h-8 cursor-pointer rounded bg-transparent border border-[#222]" />
+                        </label>
+                        <label>
+                          <div className="text-[10px] text-[#444] mb-1">Background</div>
+                          <input type="color" value={halftone.lightColor}
+                            onChange={e => patchSettings(selectedLayer.id, { lightColor: e.target.value })}
+                            className="w-full h-8 cursor-pointer rounded bg-transparent border border-[#222]" />
+                        </label>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── LEGO ── */}
+                  {lego && (
+                    <div className="space-y-3">
+                      <SliderRow label="Brick Size" value={lego.brickSize} min={6} max={48} step={1} display={`${lego.brickSize}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { brickSize: v })} />
+                      <SliderRow label="Saturation" value={lego.saturation} min={0} max={3} step={0.05} display={lego.saturation.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { saturation: v })} />
+                      <SliderRow label="Brightness" value={lego.brightness} min={-80} max={80} step={1} display={`${lego.brightness > 0 ? '+' : ''}${lego.brightness}`}
+                        onChange={v => patchSettings(selectedLayer.id, { brightness: v })} />
+                      <SliderRow label="Stud Opacity" value={lego.studOpacity} min={0} max={1} step={0.01} display={`${Math.round(lego.studOpacity * 100)}%`}
+                        onChange={v => patchSettings(selectedLayer.id, { studOpacity: v })} />
+                      <SliderRow label="Color Quantize" value={lego.quantize} min={2} max={64} step={1} display={`${lego.quantize}`}
+                        onChange={v => patchSettings(selectedLayer.id, { quantize: v })} />
+                      <SliderRow label="Border Width" value={lego.borderWidth} min={0} max={4} step={0.5} display={lego.borderWidth.toFixed(1)}
+                        onChange={v => patchSettings(selectedLayer.id, { borderWidth: v })} />
+                    </div>
+                  )}
+
+                  {/* ── Glitch ── */}
+                  {glitchS && (
+                    <div className="space-y-3">
+                      <SliderRow label="Intensity" value={glitchS.intensity} min={0} max={1} step={0.01} display={glitchS.intensity.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { intensity: v })} />
+                      <SliderRow label="Bands" value={glitchS.bands} min={1} max={30} step={1} display={`${glitchS.bands}`}
+                        onChange={v => patchSettings(selectedLayer.id, { bands: v })} />
+                      <SliderRow label="RGB Shift" value={glitchS.rgbShift} min={0} max={40} step={1} display={`${glitchS.rgbShift}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { rgbShift: v })} />
+                      <SliderRow label="Seed" value={glitchS.seed} min={0} max={100} step={1} display={`${glitchS.seed}`}
+                        onChange={v => patchSettings(selectedLayer.id, { seed: v })} />
+                    </div>
+                  )}
+
+                  {/* ── Chromatic Aberration ── */}
+                  {chromaticS && (
+                    <div className="space-y-3">
+                      <SliderRow label="Red Offset" value={chromaticS.offsetR} min={-30} max={30} step={1} display={`${chromaticS.offsetR}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { offsetR: v })} />
+                      <SliderRow label="Blue Offset" value={chromaticS.offsetB} min={-30} max={30} step={1} display={`${chromaticS.offsetB}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { offsetB: v })} />
+                      <SliderRow label="Radial" value={chromaticS.radial} min={0} max={1} step={0.01} display={chromaticS.radial.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { radial: v })} />
+                    </div>
+                  )}
+
+                  {/* ── Pixelate ── */}
+                  {pixelateS && (
+                    <div className="space-y-3">
+                      <SliderRow label="Block Size" value={pixelateS.blockSize} min={2} max={64} step={1} display={`${pixelateS.blockSize}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { blockSize: v })} />
+                      <div>
+                        <div className="text-[10px] text-[#444] mb-1 font-medium">Shape</div>
+                        <div className="flex gap-1">
+                          {(['square', 'circle'] as const).map(sh => (
+                            <button key={sh} onClick={() => patchSettings(selectedLayer.id, { shape: sh })}
+                              className={cn('flex-1 rounded text-[10px] py-1.5 border transition font-medium',
+                                pixelateS.shape === sh ? 'bg-white text-black border-white' : 'border-[#222] text-[#555] hover:text-white hover:border-[#444]'
+                              )}>{sh}</button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── Blur ── */}
+                  {blurS && (
+                    <div className="space-y-3">
+                      <div>
+                        <div className="text-[10px] text-[#444] mb-1 font-medium">Type</div>
+                        <div className="flex gap-1">
+                          {(['gaussian', 'motion', 'zoom'] as const).map(bt => (
+                            <button key={bt} onClick={() => patchSettings(selectedLayer.id, { type: bt })}
+                              className={cn('flex-1 rounded text-[10px] py-1.5 border transition font-medium',
+                                blurS.type === bt ? 'bg-white text-black border-white' : 'border-[#222] text-[#555] hover:text-white hover:border-[#444]'
+                              )}>{bt}</button>
+                          ))}
+                        </div>
+                      </div>
+                      <SliderRow label="Radius" value={blurS.radius} min={1} max={40} step={1} display={`${blurS.radius}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { radius: v })} />
+                      {blurS.type === 'motion' && (
+                        <SliderRow label="Angle" value={blurS.angle} min={0} max={360} step={1} display={`${blurS.angle}°`}
+                          onChange={v => patchSettings(selectedLayer.id, { angle: v })} />
+                      )}
+                    </div>
+                  )}
+
+                  {/* ── Noise ── */}
+                  {noiseS && (
+                    <div className="space-y-3">
+                      <SliderRow label="Amount" value={noiseS.amount} min={0} max={100} step={1} display={`${noiseS.amount}%`}
+                        onChange={v => patchSettings(selectedLayer.id, { amount: v })} />
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" checked={noiseS.monochrome}
+                          onChange={e => patchSettings(selectedLayer.id, { monochrome: e.target.checked })}
+                          className="accent-white w-3.5 h-3.5" />
+                        <span className="text-[12px] text-[#666]">Monochrome</span>
+                      </label>
+                      <div>
+                        <div className="text-[10px] text-[#444] mb-1 font-medium">Blend</div>
+                        <div className="flex gap-1">
+                          {(['overlay', 'add', 'screen'] as const).map(bl => (
+                            <button key={bl} onClick={() => patchSettings(selectedLayer.id, { blend: bl })}
+                              className={cn('flex-1 rounded text-[10px] py-1.5 border transition font-medium',
+                                noiseS.blend === bl ? 'bg-white text-black border-white' : 'border-[#222] text-[#555] hover:text-white hover:border-[#444]'
+                              )}>{bl}</button>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── VHS / CRT ── */}
+                  {vhsS && (
+                    <div className="space-y-3">
+                      <SliderRow label="Scanline Opacity" value={vhsS.scanlineOpacity} min={0} max={1} step={0.01} display={`${Math.round(vhsS.scanlineOpacity * 100)}%`}
+                        onChange={v => patchSettings(selectedLayer.id, { scanlineOpacity: v })} />
+                      <SliderRow label="Scanline Width" value={vhsS.scanlineWidth} min={1} max={6} step={1} display={`${vhsS.scanlineWidth}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { scanlineWidth: v })} />
+                      <SliderRow label="Noise" value={vhsS.noise} min={0} max={60} step={1} display={`${vhsS.noise}`}
+                        onChange={v => patchSettings(selectedLayer.id, { noise: v })} />
+                      <SliderRow label="Color Bleed" value={vhsS.colorBleed} min={0} max={20} step={1} display={`${vhsS.colorBleed}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { colorBleed: v })} />
+                      <SliderRow label="CRT Warp" value={vhsS.warp} min={0} max={0.05} step={0.001} display={vhsS.warp.toFixed(3)}
+                        onChange={v => patchSettings(selectedLayer.id, { warp: v })} />
+                    </div>
+                  )}
+
+                  {/* ── Bloom ── */}
+                  {bloomS && (
+                    <div className="space-y-3">
+                      <SliderRow label="Radius" value={bloomS.radius} min={1} max={60} step={1} display={`${bloomS.radius}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { radius: v })} />
+                      <SliderRow label="Intensity" value={bloomS.intensity} min={0} max={3} step={0.05} display={bloomS.intensity.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { intensity: v })} />
+                      <SliderRow label="Threshold" value={bloomS.threshold} min={0} max={255} step={1} display={`${bloomS.threshold}`}
+                        onChange={v => patchSettings(selectedLayer.id, { threshold: v })} />
+                      <SliderRow label="Softness" value={bloomS.softness} min={0} max={1} step={0.01} display={bloomS.softness.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { softness: v })} />
+                    </div>
+                  )}
+
+                  {/* ── Emboss / Edge ── */}
+                  {embossS && (
+                    <div className="space-y-3">
+                      <div>
+                        <div className="text-[10px] text-[#444] mb-1 font-medium">Type</div>
+                        <div className="flex gap-1">
+                          {(['emboss', 'edge', 'outline'] as const).map(et => (
+                            <button key={et} onClick={() => patchSettings(selectedLayer.id, { type: et })}
+                              className={cn('flex-1 rounded text-[10px] py-1.5 border transition font-medium',
+                                embossS.type === et ? 'bg-white text-black border-white' : 'border-[#222] text-[#555] hover:text-white hover:border-[#444]'
+                              )}>{et}</button>
+                          ))}
+                        </div>
+                      </div>
+                      <SliderRow label="Strength" value={embossS.strength} min={0.5} max={3} step={0.05} display={embossS.strength.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { strength: v })} />
+                      <SliderRow label="Original Mix" value={embossS.mix} min={0} max={1} step={0.01} display={`${Math.round(embossS.mix * 100)}%`}
+                        onChange={v => patchSettings(selectedLayer.id, { mix: v })} />
+                    </div>
+                  )}
+
+                  {/* ── Posterize ── */}
+                  {posterizeS && (
+                    <div className="space-y-3">
+                      <SliderRow label="Levels" value={posterizeS.levels} min={2} max={32} step={1} display={`${posterizeS.levels}`}
+                        onChange={v => patchSettings(selectedLayer.id, { levels: v })} />
+                      <SliderRow label="Gamma" value={posterizeS.gamma} min={0.5} max={2} step={0.01} display={posterizeS.gamma.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { gamma: v })} />
+                    </div>
+                  )}
+
+                  {/* ── Duotone ── */}
+                  {duotoneS && (
+                    <div className="space-y-3">
+                      <SliderRow label="Contrast" value={duotoneS.contrast} min={0.5} max={2} step={0.01} display={duotoneS.contrast.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { contrast: v })} />
+                      <div className="grid grid-cols-2 gap-3">
+                        <label>
+                          <div className="text-[10px] text-[#444] mb-1">Shadow</div>
+                          <input type="color" value={duotoneS.darkColor}
+                            onChange={e => patchSettings(selectedLayer.id, { darkColor: e.target.value })}
+                            className="w-full h-8 cursor-pointer rounded bg-transparent border border-[#222]" />
+                        </label>
+                        <label>
+                          <div className="text-[10px] text-[#444] mb-1">Highlight</div>
+                          <input type="color" value={duotoneS.lightColor}
+                            onChange={e => patchSettings(selectedLayer.id, { lightColor: e.target.value })}
+                            className="w-full h-8 cursor-pointer rounded bg-transparent border border-[#222]" />
+                        </label>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── Neon Glow ── */}
+                  {neonS && (
+                    <div className="space-y-3">
+                      <SliderRow label="Radius" value={neonS.radius} min={2} max={80} step={1} display={`${neonS.radius}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { radius: v })} />
+                      <SliderRow label="Intensity" value={neonS.intensity} min={0} max={4} step={0.05} display={neonS.intensity.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { intensity: v })} />
+                      <SliderRow label="Threshold" value={neonS.threshold} min={0} max={255} step={1} display={`${neonS.threshold}`}
+                        onChange={v => patchSettings(selectedLayer.id, { threshold: v })} />
+                      <SliderRow label="Edge Glow" value={neonS.edgeGlow} min={0} max={1} step={0.01} display={`${Math.round(neonS.edgeGlow * 100)}%`}
+                        onChange={v => patchSettings(selectedLayer.id, { edgeGlow: v })} />
+                      <SliderRow label="Color Mix" value={neonS.colorMix} min={0} max={1} step={0.01} display={`${Math.round(neonS.colorMix * 100)}%`}
+                        onChange={v => patchSettings(selectedLayer.id, { colorMix: v })} />
+                      <SliderRow label="Phase" value={neonS.pulsePhase} min={0} max={360} step={1} display={`${neonS.pulsePhase}°`}
+                        onChange={v => patchSettings(selectedLayer.id, { pulsePhase: v })} />
+                      <div className="grid grid-cols-2 gap-3">
+                        <label>
+                          <div className="text-[10px] text-[#444] mb-1">Color 1</div>
+                          <input type="color" value={neonS.color1}
+                            onChange={e => patchSettings(selectedLayer.id, { color1: e.target.value })}
+                            className="w-full h-8 cursor-pointer rounded bg-transparent border border-[#222]" />
+                        </label>
+                        <label>
+                          <div className="text-[10px] text-[#444] mb-1">Color 2</div>
+                          <input type="color" value={neonS.color2}
+                            onChange={e => patchSettings(selectedLayer.id, { color2: e.target.value })}
+                            className="w-full h-8 cursor-pointer rounded bg-transparent border border-[#222]" />
+                        </label>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── Motion Blur ── */}
+                  {motionS && (
+                    <div className="space-y-3">
+                      <SliderRow label="Distance" value={motionS.distance} min={1} max={100} step={1} display={`${motionS.distance}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { distance: v })} />
+                      <SliderRow label="Angle" value={motionS.angle} min={0} max={360} step={1} display={`${motionS.angle}°`}
+                        onChange={v => patchSettings(selectedLayer.id, { angle: v })} />
+                      <SliderRow label="Samples" value={motionS.samples} min={3} max={20} step={1} display={`${motionS.samples}`}
+                        onChange={v => patchSettings(selectedLayer.id, { samples: v })} />
+                      <SliderRow label="Trail Opacity" value={motionS.opacity} min={0} max={1} step={0.01} display={`${Math.round(motionS.opacity * 100)}%`}
+                        onChange={v => patchSettings(selectedLayer.id, { opacity: v })} />
+                    </div>
+                  )}
+
+                  {/* ── Text Fill ── */}
+                  {textFillS && (
+                    <div className="space-y-3">
+                      <div>
+                        <div className="text-[10px] text-[#444] mb-1 font-medium">Text / Characters</div>
+                        <input
+                          value={textFillS.text}
+                          onChange={e => patchSettings(selectedLayer.id, { text: e.target.value })}
+                          className="field text-[12px]"
+                          placeholder="Characters to use..."
+                        />
+                      </div>
+                      <div>
+                        <div className="text-[10px] text-[#444] mb-1 font-medium">Font Family</div>
+                        <select
+                          value={textFillS.fontFamily}
+                          onChange={e => patchSettings(selectedLayer.id, { fontFamily: e.target.value })}
+                          className="field text-[12px] py-1.5"
+                        >
+                          <option value="Space Grotesk">Space Grotesk</option>
+                          <option value="Helvetica Neue">Helvetica Neue</option>
+                          <option value="Arial">Arial</option>
+                          <option value="Helvetica">Helvetica</option>
+                          <option value="Inter">Inter</option>
+                          <option value="system-ui">System UI</option>
+                          <option value="Courier New">Courier New</option>
+                          <option value="monospace">Monospace</option>
+                          <option value="ui-monospace">UI Monospace</option>
+                          <option value="Menlo">Menlo</option>
+                          <option value="Monaco">Monaco</option>
+                          <option value="Consolas">Consolas</option>
+                          <option value="JetBrains Mono">JetBrains Mono</option>
+                          <option value="IBM Plex Mono">IBM Plex Mono</option>
+                          <option value="Fira Code">Fira Code</option>
+                          <option value="Verdana">Verdana</option>
+                          <option value="Georgia">Georgia</option>
+                          <option value="Times New Roman">Times New Roman</option>
+                          <option value="Impact">Impact</option>
+                        </select>
+                      </div>
+                      <SliderRow label="Font Size" value={textFillS.fontSize} min={4} max={48} step={1} display={`${textFillS.fontSize}px`}
+                        onChange={v => patchSettings(selectedLayer.id, { fontSize: v })} />
+                      <SliderRow label="Line Height" value={textFillS.lineHeight} min={0.8} max={2} step={0.05} display={textFillS.lineHeight.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { lineHeight: v })} />
+                      <SliderRow label="Letter Spacing" value={textFillS.letterSpacing} min={-2} max={10} step={0.5} display={`${textFillS.letterSpacing}`}
+                        onChange={v => patchSettings(selectedLayer.id, { letterSpacing: v })} />
+                      <SliderRow label="Density" value={textFillS.density} min={0.5} max={3} step={0.05} display={textFillS.density.toFixed(2)}
+                        onChange={v => patchSettings(selectedLayer.id, { density: v })} />
+                      <SliderRow label="Random Seed" value={textFillS.randomSeed} min={0} max={100} step={1} display={`${textFillS.randomSeed}`}
+                        onChange={v => patchSettings(selectedLayer.id, { randomSeed: v })} />
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" checked={textFillS.randomize}
+                          onChange={e => patchSettings(selectedLayer.id, { randomize: e.target.checked })}
+                          className="accent-white w-3.5 h-3.5" />
+                        <span className="text-[12px] text-[#666]">Randomize characters</span>
+                      </label>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" checked={textFillS.fillOpaque}
+                          onChange={e => patchSettings(selectedLayer.id, { fillOpaque: e.target.checked })}
+                          className="accent-white w-3.5 h-3.5" />
+                        <span className="text-[12px] text-[#666]">Fill opaque areas (needs alpha)</span>
+                      </label>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" checked={textFillS.showOriginalColor}
+                          onChange={e => patchSettings(selectedLayer.id, { showOriginalColor: e.target.checked })}
+                          className="accent-white w-3.5 h-3.5" />
+                        <span className="text-[12px] text-[#666]">Use original colors</span>
+                      </label>
+                      <div className="grid grid-cols-2 gap-3">
+                        <label>
+                          <div className="text-[10px] text-[#444] mb-1">Text color</div>
+                          <input type="color" value={textFillS.color}
+                            onChange={e => patchSettings(selectedLayer.id, { color: e.target.value })}
+                            className="w-full h-8 cursor-pointer rounded bg-transparent border border-[#222]" />
+                        </label>
+                        <div className="space-y-2">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input type="checkbox" checked={textFillS.bgColor === 'transparent'}
+                              onChange={e => patchSettings(selectedLayer.id, { bgColor: e.target.checked ? 'transparent' : '#000000' })}
+                              className="accent-white w-3.5 h-3.5" />
+                            <span className="text-[12px] text-[#666]">Transparent background</span>
+                          </label>
+                          {textFillS.bgColor !== 'transparent' && (
+                            <label>
+                              <div className="text-[10px] text-[#444] mb-1">Background</div>
+                              <input type="color" value={textFillS.bgColor}
+                                onChange={e => patchSettings(selectedLayer.id, { bgColor: e.target.value })}
+                                className="w-full h-8 cursor-pointer rounded bg-transparent border border-[#222]" />
+                            </label>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+        </div>
+      </aside>
+
+      {/* ── Main canvas area ── */}
+      <main className="flex flex-1 flex-col overflow-hidden">
+
+        {/* Top bar */}
+        <div className="flex items-center justify-between px-5 h-[49px] border-b border-[#1a1a1a] shrink-0">
+          <div className="flex items-center gap-2">
+            {layers.filter(l => l.enabled).length > 0 && (
+              <span className="tag tag-white">
+                {layers.filter(l => l.enabled).length} / {layers.length} layers active
+              </span>
+            )}
+            {hasSelection && <span className="tag tag-white">Selection active</span>}
+            {sourceHasAlpha && <span className="tag tag-white">Alpha aware</span>}
+            {isWorkspaceSource && <span className="tag tag-white">Workspace canvas</span>}
+            {canPaint && (
+              <span className="tag tag-inv">
+                {tool === 'brush' ? 'Painting mask' : 'Erasing mask'}
+              </span>
+            )}
+            {tool === 'pen' && penPath.points.length > 0 && (
+              <span className="tag tag-white">Pen: {penPath.points.length} pts{penPath.closed ? ' · closed' : ''}</span>
+            )}
+            {tool === 'magic-wand' && <span className="tag tag-white">Click to select similar colors</span>}
+            {tool === 'smart-object' && <span className="tag tag-white">Click on object to select</span>}
+            {tool === 'lasso' && <span className="tag tag-white">Drag to draw selection</span>}
+          </div>
+
+          <div className="flex items-center gap-2">
+            {sourceKind === 'video' && (
+              <button
+                onClick={exportVideo}
+                disabled={!sourceReady || isRecording}
+                className="btn btn-ghost text-[12px] disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Film size={13} />
+                {isRecording ? 'Recording…' : 'Export WebM'}
+              </button>
+            )}
+            <button
+              onClick={downloadFrame}
+              disabled={!sourceReady}
+              className="btn btn-solid text-[12px] disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Download size={13} />
+              Save PNG
+            </button>
+          </div>
+        </div>
+
+        {/* Canvas */}
+        <div className="relative flex flex-1 items-center justify-center canvas-grid overflow-hidden">
+
+          {!sourceReady ? (
+            /* Empty state */
+            <div className="flex flex-col items-center gap-5 text-center px-8 fade-in">
+              <div className="logo-text text-[64px] leading-none tracking-[-0.05em] text-[#1a1a1a]">.eana</div>
+              <div className="text-[#333] text-[13px] max-w-[360px] leading-relaxed">
+                Open an image or video, or create a workspace with your own size and then drop photos into it or paste with Ctrl+V.
+              </div>
+              <label className="btn btn-solid text-[13px] px-5 py-2.5 cursor-pointer">
+                <Upload size={15} />
+                Open file
+                <input type="file" className="hidden" accept="image/*,video/*" onChange={handleUpload} />
+              </label>
+              <button onClick={createWorkspace} className="btn btn-ghost text-[13px] px-5 py-2.5">
+                Create {Math.max(64, Math.round(workspaceWidth))}×{Math.max(64, Math.round(workspaceHeight))}
+              </button>
+              <div className="flex flex-wrap justify-center gap-1.5 mt-2">
+                {['Dither','Glow','Halftone','LEGO','Glitch','Chromatic','Pixelate','Blur','Noise','VHS/CRT','Bloom','Emboss','Posterize','Duotone','Neon Glow','Motion Blur','Text Fill'].map(f => (
+                  <span key={f} className="tag tag-white">{f}</span>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="relative max-h-full max-w-full">
+              <div className="checkerboard-bg relative overflow-hidden border border-[#1a1a1a] shadow-[0_8px_40px_rgba(0,0,0,0.8)]">
+                <canvas ref={displayRef} className="block h-auto max-h-[calc(100vh-100px)] w-auto max-w-full" />
+                <canvas
+                  ref={overlayRef}
+                  onPointerDown={handlePointerDown}
+                  onPointerMove={handlePointerMove}
+                  onPointerUp={handlePointerUp}
+                  onPointerCancel={handlePointerUp}
+                  className="absolute inset-0 block h-auto max-h-[calc(100vh-100px)] w-auto max-w-full"
+                  style={{ cursor, touchAction: 'none' }}
+                />
+              </div>
+
+              {/* size badge */}
+              <div className="absolute bottom-2 right-2 flex items-center gap-2">
+                {isWorkspaceSource && (
+                  <div className="tag tag-white opacity-70">Drop photo / Ctrl+V</div>
+                )}
+                <div className="tag tag-white opacity-60">
+                  {mediaSize.width} × {mediaSize.height}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </main>
+
+      <video ref={hiddenVideoRef} className="hidden" playsInline muted />
+
+      {isDropTargetActive && (
+        <div className="pointer-events-none fixed inset-0 z-40 flex items-center justify-center bg-black/72 backdrop-blur-sm">
+          <div className="rounded-2xl border border-white/15 bg-[#0b0b0b] px-8 py-7 text-center shadow-[0_20px_80px_rgba(0,0,0,0.55)]">
+            <div className="text-[14px] font-medium text-white">
+              {isWorkspaceSource && sourceReady ? 'Drop photo into workspace' : 'Drop image or video to open'}
+            </div>
+            <div className="mt-2 text-[12px] text-[#8a8a8a]">
+              {isWorkspaceSource && sourceReady ? 'You can also paste with Ctrl+V' : 'You can also create a custom workspace first'}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Created by neezzy */}
+      <a
+        href="https://t.me/neezzy"
+        target="_blank"
+        rel="noopener noreferrer"
+        className="fixed bottom-4 right-4 z-50 text-[11px] font-medium tracking-wide text-black border border-white bg-white hover:bg-[#eaeaea] px-3 py-1.5 rounded-full transition-all duration-300 backdrop-blur-sm shadow-[0_6px_24px_rgba(255,255,255,0.12)]"
+        style={{ fontFamily: "'Space Grotesk', sans-serif" }}
+      >
+        Created by <span className="text-black">neezzy</span>
+      </a>
+    </div>
+  );
+}
